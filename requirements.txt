@@ -1,2 +1,15 @@
 jupyter
 jupyter-cache
+natsort
+numpy
+scipy
+matplotlib
+scikit-learn
+tifffile
+pyvisa
+pyvisa-py
+pyusb
+libusb-package
+pytest
+pyqtgraph
+PyQt6
