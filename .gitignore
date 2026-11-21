@@ -7,3 +7,9 @@ build/
 .venv/
 
 **/*.quarto_ipynb
+
+# Recorded data, design notes and Python bytecode
+data/
+docs/
+__pycache__/
+*.orig.ipynb

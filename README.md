@@ -19,12 +19,12 @@ You only need to do these once locally.
 > [!note]
 > You can skip this step if you don't require any code execution in your presentation.
 
-If you have additional requirements for your execution environment (e.g. your Python package) append them to `requirements.txt`.
+If you have additional requirements for your execution environment (e.g. your Python package) add them to `dependencies` in `pyproject.toml`.
 
 We recommend using [uv](https://uv.sh/) to manage your Python environment:
 * Create a new environment with `uv venv --python=3.13`. Make sure the Python version matches the one used in your GitHub Actions workflow.
 * Activate the environment with `source .venv/bin/activate` 
-* Install the required packages with `uv pip install -r requirements.txt`
+* Install the required packages with `uv pip install -r pyproject.toml --group dev` (the `dev` group adds pytest for running `tests/`)
 
 > [!warning]
 > Make sure Quarto is using the correct Python environment 

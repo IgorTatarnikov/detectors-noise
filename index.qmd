@@ -11,6 +11,7 @@ format:
 #| echo: false
 
 import glob
+import json
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,6 +22,15 @@ from sklearn.linear_model import LinearRegression
 
 %matplotlib inline
 plt.style.use('seaborn-v0_8-talk')
+
+# A session recorded with scripts/basler_live.py (--open data/live/practical). Without the camera,
+# scripts/simulate_session.py writes a simulated session in the same layout.
+data_dir = 'data/live/practical/'
+
+def load_metadata(directory_path: str):
+    """The settings read back from the camera when the recording was made."""
+    with open(directory_path + 'metadata.json') as f:
+        return json.load(f)
 
 def load_tiff_directory(directory_path: str):
     tiff_paths = natsorted(glob.glob(directory_path + '*.tif*'))
@@ -158,7 +168,7 @@ def plot_readout_noise_multiple_gain(gain_levels: list[str], path_stub: str,  do
 #| output-location: fragment
 
 gain_levels = [1]
-read_noise_stub = 'data/Basler_RAAC_2024_09_26/read_noise/40us_'
+read_noise_stub = f'{data_dir}read_noise/'
 downsample_by = 5
 
 _ = plot_readout_noise_multiple_gain(gain_levels, read_noise_stub, downsample_by)
@@ -170,44 +180,24 @@ _ = plot_readout_noise_multiple_gain(gain_levels, read_noise_stub, downsample_by
 #| output-location: fragment
 
 gain_levels = [0, 1, 12, 24]
-clipped_read_noise, read_set_bias = plot_readout_noise_multiple_gain(gain_levels, read_noise_stub, downsample_by)
+# Check which camera recorded the session: the simulator's recordings say "Simulated"
+print(f"Camera: {load_metadata(f'{read_noise_stub}{gain_levels[0]}dB/')['camera_model']}")
+read_noise, read_bias = plot_readout_noise_multiple_gain(gain_levels, read_noise_stub, downsample_by)
 ```
 
-## The read noise movies are clipped
-- These movies were acquired with no offset, so 30-92% of values are clipped at 0
-- Clipping removes the negative fluctuations, so the standard deviation comes out too low
-- The dark frames do have an offset and contain no clipped values, so we can use them instead
-- Taking the difference of two short exposures removes the fixed pattern
+## Read noise results{.smaller}
+- First check that 0% of values are clipped at 0
+- If any are, the black level was too low: the negative fluctuations are cut off and the standard deviation comes out too low
 
-## Measuring read noise without clipping
-```{python}
-#| echo: true
-#| output-location: fragment
+::: {.fragment}
+| Gain | Bias (counts) | Read noise (counts) |
+|---|---|---|
+| 0 dB | | |
+| 1 dB | | |
+| 12 dB | | |
+| 24 dB | | |
 
-def read_noise_from_frame_pair(directory_path: str):
-    """
-    Estimate read noise from the two shortest exposures in a directory of dark frames.
-
-    Parameters
-    ----------
-    directory_path : str
-        Path to the directory containing the dark frames.
-
-    Returns
-    -------
-    read_noise : float
-        RMS read noise across pixels, in counts.
-    """
-    frames = load_tiff_directory(directory_path)
-    # Subtracting two frames doubles the variance
-    return np.std(frames[0] - frames[1]) / np.sqrt(2)
-
-dark_counts_stub = 'data/Basler_RAAC_2024_09_26/dark_noise'
-read_noise = [read_noise_from_frame_pair(f'{dark_counts_stub}/{gain}dB/') for gain in gain_levels]
-
-for gain, clipped, unclipped in zip(gain_levels, clipped_read_noise, read_noise):
-    print(f'{gain} dB: {clipped:.2f} counts from the clipped movie, {unclipped:.2f} counts from the dark frames')
-```
+:::
 
 ## Dark noise
 - Generation of electrons in a photon independent manner
@@ -281,13 +271,19 @@ def calc_plot_dark_counts(im_data, exposures):
 #| echo: true
 #| output-location: fragment
 
+def load_dark_series(gain_dir):
+    """The mean image at each exposure, and the exposures in seconds from metadata.json."""
+    folders = sorted(glob.glob(gain_dir + '*us/'), key=lambda f: load_metadata(f)['exposure_us'])
+    exposures = np.array([load_metadata(f)['exposure_us'] * 1e-6 for f in folders])
+    images = np.stack([load_tiff_directory(f).mean(axis=0) for f in folders])
+    return images, exposures
+
 dark_count_results = []
+dark_exposures = []
 
 print(f'Dark counts for {gain_levels[0]}dB')
-full_path = f'{dark_counts_stub}/{gain_levels[0]}dB/'
-dark_images = load_tiff_directory(full_path)
-
-exposures = np.array([0.00004, 0.001, 0.01, 0.1, 1, 10])
+dark_images, exposures = load_dark_series(f'{data_dir}dark/{gain_levels[0]}dB/')
+dark_exposures.append(exposures)
 dark_count_results.append(calc_plot_dark_counts(dark_images, exposures))
 ```
 
@@ -295,25 +291,24 @@ dark_count_results.append(calc_plot_dark_counts(dark_images, exposures))
 ```{python}
 #| echo: true
 #| output-location: fragment
-for i, gain in enumerate(gain_levels[1:]):
+for gain in gain_levels[1:]:
     print(f'Dark counts for {gain}dB')
-    full_path = f'{dark_counts_stub}/{gain}dB/'
-    dark_images = load_tiff_directory(full_path)
-        
+    dark_images, exposures = load_dark_series(f'{data_dir}dark/{gain}dB/')
+    dark_exposures.append(exposures)
     dark_count_results.append(calc_plot_dark_counts(dark_images, exposures))
 ```
 
 ## Dark noise results{.smaller}
-- Counts change by less than 2 up to 10 ms, then grow roughly linearly with exposure time
-- These values are in 16-bit counts: the camera's 12-bit values are shifted left by 4 bits
+- Counts are the camera's raw 12-bit values (0-4095)
+- The bias is the mean at the shortest exposure, where dark counts are negligible
 
 ::: {.fragment}
-| Gain | Bias (counts) | Dark counts (counts/pixel/s) | Dark counts (12-bit counts/pixel/s) |
-|---|---|---|---|
-| 0 dB | 150.7 | 16.6 | 1.04 |
-| 1 dB | 151.2 | 23.4 | 1.46 |
-| 12 dB | 297.7 | 93.0 | 5.81 |
-| 24 dB | 1117.1 | 449.6 | 28.1 |
+| Gain | Bias (counts) | Dark counts (counts/pixel/s) |
+|---|---|---|
+| 0 dB | | |
+| 1 dB | | |
+| 12 dB | | |
+| 24 dB | | |
 
 :::
 
@@ -329,16 +324,19 @@ $$
 :::
 
 ## What value do saturated pixels have?
-- The images store 12-bit values shifted left by 4 bits, so every value is a multiple of 16
-- Full scale is therefore 4095 * 16 = 65520, not 65535
-- The 10 s dark frames contain saturated hot pixels, so we can read this from the data
+- The camera records 12-bit values, so full scale is 4095
+- Every recording's metadata.json stores this as `max_value`
+- A recording of a saturated scene confirms it
 
 ::: {.fragment}
 ```{python}
 #| echo: true
 
-saturated_value = int(load_tiff_directory(f'{dark_counts_stub}/{gain_levels[-1]}dB/').max())
+saturated_value = load_metadata(f'{read_noise_stub}{gain_levels[0]}dB/')['max_value']
 print(f'Saturated pixels are assigned the value {saturated_value}')
+
+for path in natsorted(glob.glob(f'{data_dir}saturation/*/')):
+    print(f'{path}: brightest value {int(load_tiff_directory(path).max())}')
 ```
 
 :::
@@ -359,7 +357,7 @@ sat_value = saturated_value - bias
 # subtracted dark count for 1 ms exposure
 dark_count = subtracted_counts[exposure_index]
 print(f'Saturation after bias removal at {gain_levels[gain_index]} dB gain is {sat_value:.0f} counts')
-print(f'Dark counts at {exposures[exposure_index]*1000:.2f} ms exposure are {dark_count:.2f}')
+print(f'Dark counts at {dark_exposures[gain_index][exposure_index]*1000:.2f} ms exposure are {dark_count:.2f}')
 
 dynamic_range = (sat_value - dark_count) / read_noise[gain_index]
 
@@ -381,7 +379,7 @@ sat_value = saturated_value - bias
 # subtracted dark count for 1 ms exposure
 dark_count = subtracted_counts[exposure_index]
 print(f'Saturation after bias removal at {gain_levels[gain_index]} dB gain is {sat_value:.0f} counts')
-print(f'Dark counts at {exposures[exposure_index]*1000:.2f} ms exposure are {dark_count:.2f}')
+print(f'Dark counts at {dark_exposures[gain_index][exposure_index]*1000:.2f} ms exposure are {dark_count:.2f}')
 
 dynamic_range = (sat_value - dark_count) / read_noise[gain_index]
 
@@ -391,10 +389,10 @@ print(f'The dynamic range of the camera at {gain_levels[gain_index]} dB gain is 
 ## Dynamic range results
 | Gain | Dynamic range | Dynamic range (dB) |
 |---|---|---|
-| 0 dB | 5012:1 | 74.0 |
-| 1 dB | 4638:1 | 73.3 |
-| 12 dB | 1753:1 | 64.9 |
-| 24 dB | 512:1 | 54.2 |
+| 0 dB | | |
+| 1 dB | | |
+| 12 dB | | |
+| 24 dB | | |
 
 - Dynamic range is highest at the lowest gain
 - Increasing the gain raises read noise in counts, while the digitizer's maximum value stays fixed
@@ -576,24 +574,25 @@ Therefore we can plot the variance of image values against the mean image value,
 ```{python}
 #| echo: true
 
-def drop_repeated_frames(images):
+def check_frames(directory_path: str):
     """
-    Remove frames that are identical to the previous frame.
+    Check that the camera reported no missing or repeated frames.
 
     Parameters
     ----------
-    images : np.ndarray
-        Stack of images with shape (num_images, height, width).
+    directory_path : str
+        Path to the recording.
 
     Returns
     -------
-    unique_images : np.ndarray
-        Stack of images with the repeated frames removed.
+    metadata : dict
+        The recording's metadata.json.
     """
-    is_new_frame = np.any(images[1:] != images[:-1], axis=(1, 2))
-    return images[np.r_[True, is_new_frame]]
+    meta = load_metadata(directory_path)
+    assert meta['missing_frames'] == 0 and meta['repeated_frames'] == 0, f'{directory_path}: frames were dropped or repeated'
+    return meta
 
-def measure_shot_noise(image_path: str, offset: float):
+def measure_shot_noise(image_path: str, dark_path: str):
     """
     Measure the mean and variance of each pixel across a movie.
 
@@ -601,8 +600,9 @@ def measure_shot_noise(image_path: str, offset: float):
     ----------
     image_path : str
         Path to the directory containing shot noise images.
-    offset : float
-        Bias offset to subtract from the images.
+    dark_path : str
+        Path to a dark stack recorded at the same settings. Its per-pixel mean
+        removes the bias, the fixed pattern and the dark counts.
 
     Returns
     -------
@@ -611,12 +611,14 @@ def measure_shot_noise(image_path: str, offset: float):
     var : np.ndarray
         Variance of each pixel with shape (num_pixels, 1).
     """
-    shot_image = drop_repeated_frames(load_tiff_directory(image_path)) - offset
+    check_frames(image_path)
+    offset = np.mean(load_tiff_directory(dark_path), axis=0)
+    shot_image = load_tiff_directory(image_path) - offset
 
     # Rescale each frame to the same mean so that frame-to-frame changes in the
     # illumination are not counted as shot noise.
     frame_means = np.mean(shot_image, axis=(1, 2), dtype=np.float64)
-    print(f'{shot_image.shape[0]} unique frames, frame means vary by {np.std(frame_means, ddof=1) / np.mean(frame_means):.2%}')
+    print(f'{shot_image.shape[0]} frames, frame means vary by {np.std(frame_means, ddof=1) / np.mean(frame_means):.2%}')
     shot_image = shot_image / (frame_means / np.mean(frame_means)).reshape(-1, 1, 1).astype(np.float32)
 
     mean = np.mean(shot_image, axis=0, dtype=np.float32).reshape(-1, 1)
@@ -624,7 +626,7 @@ def measure_shot_noise(image_path: str, offset: float):
 
     return mean, var
 
-def calculate_plot_shot_noise(image_path: str, offset: float, downsample:int = 5):
+def calculate_plot_shot_noise(image_path: str, dark_path: str, downsample:int = 5):
     """
     Calculate and plot shot noise to estimate camera gain.
 
@@ -632,12 +634,12 @@ def calculate_plot_shot_noise(image_path: str, offset: float, downsample:int = 5
     ----------
     image_path : str
         Path to the directory containing shot noise images.
-    offset : float
-        Bias offset to subtract from the images.
+    dark_path : str
+        Path to the dark stack recorded at the same settings.
     downsample : int, optional
         Factor by which to downsample the images for faster computation.
     """
-    mean, var = measure_shot_noise(image_path, offset)
+    mean, var = measure_shot_noise(image_path, dark_path)
     
     model = LinearRegression()
     model.fit(mean, var)
@@ -670,28 +672,15 @@ def calculate_plot_shot_noise(image_path: str, offset: float, downsample:int = 5
 #| echo: true
 #| output-location: fragment
 
-gain_index = 2
-exposure_index = 2
-print(f"Shot noise for {gain_levels[gain_index]}dB {exposures[exposure_index]*1000:.0f} ms exposure")
+# Each lit recording shot/<label>/ is paired with shot/<label>_dark/, taken at the same settings
+shot_paths = natsorted(p for p in glob.glob(f'{data_dir}shot/*/') if not p.rstrip('/').endswith('_dark'))
+shot_results = []
 
-# The shot noise movies appear to come from the same session as the read noise movies (1216 rows, same
-# file naming), not the dark frames (1208 rows), so we use the bias of the read noise set.
-bias = read_set_bias[gain_index]
-shot_noise_10ms_12db_path = 'data/Basler_RAAC_2024_09_26/shot_noise/10ms_12dB/'
-shot_noise_10ms_12db_gain, shot_noise_10ms_12db_intercept = calculate_plot_shot_noise(shot_noise_10ms_12db_path, bias)
-```
-
-
-## Estimating gain using shot noise
-```{python}
-#| echo: true
-#| output-location: fragment
-exposure_index = 3
-print(f"Shot noise for {gain_levels[gain_index]}dB {exposures[exposure_index]*1000:.0f} ms exposure")
-
-# Use the same bias as before
-shot_noise_100ms_12db_path = 'data/Basler_RAAC_2024_09_26/shot_noise/100ms_12dB/'
-shot_noise_100ms_12db_gain, shot_noise_100ms_12db_intercept = calculate_plot_shot_noise(shot_noise_100ms_12db_path, bias)
+for path in shot_paths:
+    meta = load_metadata(path)
+    print(f"Shot noise for {meta['label']}: {meta['gain']:g} dB, {meta['exposure_us'] / 1000:g} ms exposure")
+    gain, intercept = calculate_plot_shot_noise(path, path.rstrip('/') + '_dark/')
+    shot_results.append({'path': path, 'gain_db': meta['gain'], 'counts_per_e': gain, 'intercept': intercept})
 ```
 
 ## Converting to electrons
@@ -699,62 +688,65 @@ shot_noise_100ms_12db_gain, shot_noise_100ms_12db_intercept = calculate_plot_sho
 #| echo: true
 #| output-location: fragment
 
-gain_12db = np.mean([shot_noise_10ms_12db_gain, shot_noise_100ms_12db_gain])
-print(f"Gain at 12 dB is {gain_12db:.2f} counts/e-, or {gain_12db / 16:.3f} 12-bit counts/e-")
+shot_gain_db = shot_results[0]['gain_db']
+# The camera reads its gain back to its own step size (e.g. 11.99 dB for 12), so match the nearest setting
+gain_index = int(np.argmin(np.abs(np.array(gain_levels) - shot_gain_db)))
+assert abs(gain_levels[gain_index] - shot_gain_db) < 0.1, 'record read noise and dark counts at the shot noise gain too'
+same_gain = [r for r in shot_results if abs(r['gain_db'] - shot_gain_db) < 0.1]
+camera_gain = np.mean([r['counts_per_e'] for r in same_gain])
+print(f"Gain at {shot_gain_db:g} dB is {camera_gain:.3f} counts/e-, or {1 / camera_gain:.2f} e- per count")
 
-readout_noise_e = read_noise[gain_index] / gain_12db
-print(f"Read noise in e- for 12 dB is: {readout_noise_e:.3f}")
+readout_noise_e = read_noise[gain_index] / camera_gain
+print(f"Read noise in e- for {shot_gain_db:g} dB is: {readout_noise_e:.3f}")
 
-for name, intercept in [('10 ms', shot_noise_10ms_12db_intercept), ('100 ms', shot_noise_100ms_12db_intercept)]:
-    print(f"Read noise implied by the {name} y-intercept is {np.sqrt(intercept):.1f} counts ({np.sqrt(intercept) / gain_12db:.1f} e-), "
-          f"compared to {read_noise[gain_index]:.1f} counts measured directly")
+for r in same_gain:
+    implied = np.sqrt(r['intercept']) if r['intercept'] > 0 else np.nan
+    print(f"Read noise implied by the y-intercept is {implied:.2f} counts ({implied / camera_gain:.2f} e-), "
+          f"compared to {read_noise[gain_index]:.2f} counts measured directly")
 
-dark_rate_12db = dark_count_results[gain_index][2].coef_[0]
-print(f"Dark counts at 12 dB are {dark_rate_12db:.1f} counts/pixel/s, or {dark_rate_12db / gain_12db:.1f} e-/pixel/s")
+dark_rate = dark_count_results[gain_index][2].coef_[0]
+print(f"Dark counts at {shot_gain_db:g} dB are {dark_rate:.2f} counts/pixel/s, or {dark_rate / camera_gain:.2f} e-/pixel/s")
 ```
 
-## Corrections to the shot noise data
-- The 100 ms movies contain many repeated frames, e.g. only 44 unique frames out of 109 at 12 dB
-- Repeated frames are not independent measurements, so we remove them
-- Frame means vary by up to 0.92%, so the illumination was not perfectly stable
+## Checks on the shot noise data
+- The camera numbers its frames, so missing or repeated frames are caught when recording: they are not independent measurements
+- If the frame means vary, the illumination was not perfectly stable
 - We rescale each frame, otherwise the extra variance inflates the slope
+- The dark stack at identical settings removes the bias exactly, so no offset has to be guessed
 
 ## Does the gain follow the nominal gain?
 ```{python}
 #| echo: true
 #| output-location: fragment
 
-# Slope in counts/e-, scaled to 16-bit counts. The 0 dB movie was saved as 8-bit, so its counts are 256 times larger.
-for name, scale in [('10ms_0dB', 256), ('20ms_6dB', 1), ('100ms_6dB', 1), ('10ms_12dB', 1), ('100ms_12dB', 1)]:
-    print(name)
-    mean, var = measure_shot_noise(f'data/Basler_RAAC_2024_09_26/shot_noise/{name}/', 0)
-    slope = LinearRegression().fit(mean, var).coef_[0][0]
-    print(f'Gain is {slope * scale:.2f} counts/e-')
+# With shot noise recorded at several gains, the measured gain should follow the nominal 10^(dB/20)
+for r in shot_results:
+    print(f"{r['gain_db']:g} dB: {r['counts_per_e']:.3f} counts/e-, "
+          f"implying {r['counts_per_e'] / 10 ** (r['gain_db'] / 20):.3f} counts/e- at 0 dB")
 ```
 
 ## Where does the fit line intersect the y-axis?{.smaller}
-- We expect the read noise variance: $37.2^2 \approx 1384$ counts$^2$ at 12 dB
+- We expect the read noise variance, measured directly in the first section
 
 ::: {.fragment}
-| Fit | Intercept, 10 ms (counts$^2$) | Intercept, 100 ms (counts$^2$) |
+| Fit | Intercept (counts$^2$) | Read noise$^2$ measured directly (counts$^2$) |
 |---|---|---|
-| All pixels | 4369 | 2643 |
-| Dimmest pixels only | 1692 | 2035 |
+| All pixels | | |
+| Dimmest pixels only | | |
 
 :::
 
-- The intercept is positive, which makes sense, but it is not a precise measurement of read noise
-- The dimmest pixel has a mean of more than 4300 counts, so the fit extrapolates a long way to reach 0
-- Variance is not perfectly linear in the mean, and a slope change of 0.2 shifts the intercept by thousands
-- The direct measurement from the dark frames (4.6 e-) is the one to trust
+- The intercept is an extrapolation: the further the dimmest pixel is from 0, the less precise it is
+- If variance is not perfectly linear in the mean, a small slope change shifts the intercept a lot
+- The direct measurement from the dark stack is the one to trust
 
 ## Comparison with the specification sheet
 ```{python}
 #| echo: true
 #| output-location: fragment
 
-# Nominal gain at 0 dB, assuming 12 dB is a factor of 10^(12/20) = 3.98
-gain_0db = gain_12db / 10 ** (12 / 20)
+# Nominal gain at 0 dB, assuming the gain setting in dB is exact
+gain_0db = camera_gain / 10 ** (shot_gain_db / 20)
 raw_counts, subtracted_counts, _ = dark_count_results[0]
 sat_0db = saturated_value - raw_counts[0]
 dynamic_range_0db = (sat_0db - subtracted_counts[1]) / read_noise[0]
@@ -768,11 +760,10 @@ print(f'Dynamic range {dynamic_range_0db:.0f}:1 ({20 * np.log10(dynamic_range_0d
 ## Comparison with the specification sheet{.smaller}
 | Quantity at 0 dB | Measured | Specification |
 |---|---|---|
-| Read noise | 6.5 e- | 6.9 e- |
-| Saturation | 32.4 ke- | 32.8 ke- |
-| Dynamic range | 5012:1 (74.0 dB) | 73.5 dB |
+| Read noise | | 6.9 e- |
+| Saturation | | 32.8 ke- |
+| Dynamic range | | 73.5 dB |
 
-- Our results agree with the specification to within about 6%
 - Specification values are EMVA 1288 figures listed by [a reseller](https://ww2.avsupply.com/ITM/31548/aca1920-40um.html), not a Basler document
 - Saturation only reflects the full well capacity at low gain
-- At higher gain the digitizer reaches its maximum first: at 12 dB, saturation is only about 8100 e-
+- At higher gain the digitizer reaches its maximum first

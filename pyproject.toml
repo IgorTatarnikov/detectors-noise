@@ -1,0 +1,37 @@
+[project]
+name = "detectors-noise"
+version = "0.1.0"
+description = "Detectors and noise practical: slides, worked notebook, and live acquisition tools for a Basler camera and a SiPM"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    # Slides and notebook
+    "jupyter",
+    "jupyter-cache",
+    "matplotlib",
+    "natsort",
+    "numpy",
+    "scikit-learn",
+    "scipy",
+    "tifffile",
+    # Live acquisition GUIs
+    "pyqtgraph",
+    "PyQt6",
+    "pypylon",  # Basler cameras
+    "pyusb",  # USB-201 DAQ
+    "libusb-package",
+    "pyvisa",  # Rigol oscilloscope
+    "pyvisa-py",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+# Scripts in scripts/ are run directly, not installed as a package.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
