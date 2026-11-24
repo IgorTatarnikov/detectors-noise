@@ -1,0 +1,50 @@
+{
+  "camera_model": "acA4112-20um",
+  "recorded": "2026-11-24",
+  "gains": [
+    {
+      "gain_db": 0,
+      "bias": 127.42932032552083,
+      "read_noise": 0.8647389391806574,
+      "dark_bias": 127.44041874186196,
+      "dark_counts_per_s": 0.4442654404857552,
+      "saturation": 3967.5706796744794,
+      "dynamic_range": 4588.169821606149,
+      "dynamic_range_db": 73.23278968075523,
+      "counts_per_e": 0.3980670451575441
+    },
+    {
+      "gain_db": 1,
+      "bias": 126.38041078125,
+      "read_noise": 0.930336369702929,
+      "dark_bias": 126.39585314127605,
+      "dark_counts_per_s": 0.5024243184028025,
+      "saturation": 3968.61958921875,
+      "dynamic_range": 4265.790364991665,
+      "dynamic_range_db": 72.59999017949097,
+      "counts_per_e": 0.44596895586337776
+    },
+    {
+      "gain_db": 12,
+      "bias": 127.78526774739584,
+      "read_noise": 2.4417121782679656,
+      "dark_bias": 127.83043275553385,
+      "dark_counts_per_s": 1.7878492016673022,
+      "saturation": 3967.2147322526043,
+      "dynamic_range": 1624.7651945318971,
+      "dynamic_range_db": 64.21581214214672,
+      "counts_per_e": 1.543480232949823
+    },
+    {
+      "gain_db": 24,
+      "bias": 126.24492143361581,
+      "read_noise": 7.917094034888707,
+      "dark_bias": 126.47611182996962,
+      "dark_counts_per_s": 7.192724266851851,
+      "saturation": 3968.7550785663843,
+      "dynamic_range": 501.2881314378874,
+      "dynamic_range_db": 54.001748446458095,
+      "counts_per_e": 6.08552837150125
+    }
+  ]
+}
