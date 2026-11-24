@@ -23,13 +23,13 @@ from basler_camera import SimulatedCamera, camera_metadata
 from recording import RecordingWriter, exposure_label
 
 GAINS = (0.0, 1.0, 12.0, 24.0)
-DARK_EXPOSURES_MS = (0.04, 1, 10, 100, 1000, 10000)
+DARK_EXPOSURES_MS = (0.04, 1, 10, 100, 1000)
 BLACK_LEVEL = 64
 
 
 def record(cam: SimulatedCamera, path: Path, frames: int, metadata: dict) -> dict:
     writer = RecordingWriter(path, {**metadata, **camera_metadata(cam)})
-    cam.grab(1)  # the GUI discards the first frame after a settings change
+    cam.grab(1)  # the GUI discards SETTLE_S of frames after a change; the simulator has no offset to settle
     for _ in range(frames):
         f = cam.grab(1)
         writer.add(f.image, f.block_id, f.timestamp)
@@ -44,8 +44,7 @@ def simulate_session(
     dark_frames: int = 3,
     gains=GAINS,
     dark_exposures_ms=DARK_EXPOSURES_MS,
-    shot_gain: float = 12.0,
-    shot_exposure_ms: float = 20.0,
+    shot_exposure_ms: float = 200.0,
     seed: int = 0,
     **camera_options,
 ) -> SimulatedCamera:
@@ -63,13 +62,14 @@ def simulate_session(
         for ms in dark_exposures_ms:
             us = cam.set("exposure_us", ms * 1e3)
             record(cam, session / "dark" / f"{g:g}dB" / exposure_label(us), dark_frames, {"section": "dark"})
-    cam.set("gain", shot_gain)
-    cam.set("exposure_us", shot_exposure_ms * 1e3)
-    lit = session / "shot" / "light1"
+    # The scene falls off from the centre, so one stack spans dark to saturated. As in the
+    # GUI, the exposure is scaled with gain so the image stays about as bright.
     cam.covered = False
-    record(cam, lit, frames, {"section": "shot", "label": "light1", "notes": "simulated"})
+    for g in gains:
+        cam.set("gain", g)
+        cam.set("exposure_us", shot_exposure_ms * 1e3 * 10 ** (-g / 20))
+        record(cam, session / "shot" / f"{g:g}dB", frames, {"section": "shot", "notes": "simulated"})
     cam.covered = True
-    record(cam, session / "shot" / "light1_dark", frames, {"section": "shot_dark", "label": "light1", "pair": str(lit)})
     return cam
 
 

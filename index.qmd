@@ -4,44 +4,32 @@ author: Igor & Isabell
 date: today
 format:
   revealjs:
-    footer: "Detectors and Noise | 19-11-2025"
+    footer: "Detectors and Noise | 24-11-2026"
 ---
 
 ```{python}
-#| echo: false
+#| include: false
 
-import glob
 import json
 
 import matplotlib.pyplot as plt
 import numpy as np
-import tifffile
-
-from natsort import natsorted
-from sklearn.linear_model import LinearRegression
 
 %matplotlib inline
 plt.style.use('seaborn-v0_8-talk')
 
-# A session recorded with scripts/basler_live.py (--open data/live/practical). Without the camera,
-# scripts/simulate_session.py writes a simulated session in the same layout.
-data_dir = 'data/live/practical/'
+# Every number and the plot in these slides come from this file. The recordings behind it are
+# too big for git: scripts/summarise_session.py calculates it from a session in data/live/.
+results_path = 'results/practical.json'
+with open(results_path) as f:
+    results = json.load(f)['gains']
+gain_levels = np.array([r['gain_db'] for r in results])
+camera_gain = np.array([r['counts_per_e'] for r in results])
 
-def load_metadata(directory_path: str):
-    """The settings read back from the camera when the recording was made."""
-    with open(directory_path + 'metadata.json') as f:
-        return json.load(f)
-
-def load_tiff_directory(directory_path: str):
-    tiff_paths = natsorted(glob.glob(directory_path + '*.tif*'))
-    curr_img = tifffile.imread(tiff_paths[0])
-    images = np.empty((len(tiff_paths), curr_img.shape[0], curr_img.shape[1]), dtype=np.float32)
-    images[0] = curr_img
-
-    for i, tiff_path in enumerate(tiff_paths[1:]):
-        images[i+1] = tifffile.imread(tiff_path)
-        
-    return images
+def show_table(headers, rows):
+    for row in [headers, ['---'] * len(headers), *rows]:
+        print('| ' + ' | '.join(row) + ' |')
+    print('\n: From a previous run\n')
 ```
 
 ## Read noise
@@ -56,146 +44,21 @@ def load_tiff_directory(directory_path: str):
 - Calculate the standard deviation for each pixel across the stack of images
 - Average the standard deviation values across all pixels to get a single read noise value
 
-## Measuring read noise
-```{python}
-#| echo: true
-
-def measure_readout_noise(im_data, downsample=5):
-    """
-    Measure the readout noise from a stack of images.
-
-    Parameters
-    ----------
-    im_data : np.ndarray
-        Stack of images with shape (num_images, height, width).
-    downsample : int, optional
-        Factor by which to downsample the images for faster computation.
-
-    Returns
-    -------
-    readout_noise : np.ndarray
-        Standard deviation of each pixel across the stack of images.
-    """
-    im_data = im_data[:, ::downsample, ::downsample]
-    readout_noise = np.std(im_data, axis=0, ddof=1, dtype=np.float32)
-
-    return readout_noise
-
-def calc_plot_readout_noise(im_data, axis, downsample=5):
-    """
-    Calculate and plot the readout noise histogram.
-    
-    Parameters
-    ----------
-    im_data : np.ndarray
-        Stack of images with shape (num_images, height, width).
-    axis : matplotlib.axes.Axes
-        Axis on which to plot the histogram.
-    downsample : int, optional
-        Factor by which to downsample the images for faster computation.
-    """
-    pix_dev = measure_readout_noise(im_data, downsample)
-    mean_dev = np.mean(pix_dev, dtype=np.float32)
-    
-    axis.hist(pix_dev.flatten(), bins=100)
-    axis.axvline(mean_dev, color='r', linestyle='--')
-    axis.text(0.8, 0.8, f'Mean: {mean_dev:.3f}', ha='center', va='center', transform=axis.transAxes)
-    axis.set_ylabel('Count')
-    axis.set_xlabel('Standard deviation')
-    
-    return mean_dev
-
-def plot_readout_noise_multiple_gain(gain_levels: list[str], path_stub: str,  downsample: int):
-    """
-    Plot readout noise histograms for multiple gain levels.
-
-    Parameters
-    ----------
-    gain_levels : list[str]
-        List of gain levels to process.
-    path_stub : str
-        Base path to the directory containing gain level subdirectories.
-    downsample : int
-        Factor by which to downsample the images for faster computation.
-
-    Returns
-    -------
-    mean_devs : list[float]
-        Average standard deviation across pixels for each gain level.
-    bias : list[float]
-        Mean image value for each gain level.
-    """
-    num_plots = (len(gain_levels) + 1) // 2
-    num_columns = 2 if len(gain_levels) > 1 else 1
-    
-    fig, ax = plt.subplots(num_plots, num_columns, figsize=(10, 5 * num_plots))
-    mean_devs = []
-    bias = []
-    
-    for i, gain in enumerate(gain_levels):
-        read_noise_images = load_tiff_directory(f'{path_stub}{gain}dB/')
-        bias.append(np.mean(read_noise_images, dtype=np.float32))
-        print(f'{gain} dB: {np.mean(read_noise_images == 0):.1%} of values are clipped at 0')
-        curr_ax = ax[i//2][i%2] if num_plots > 1 else ax
-        mean_devs.append(calc_plot_readout_noise(read_noise_images, curr_ax, downsample))
-        curr_ax.set_title(f'{gain}dB')
-
-    if num_plots > 1:
-      for row in ax:
-          x_lim = row[-1].get_xlim()
-          for axis in row:
-              axis.set_xlim(x_lim)
-
-
-    plt.tight_layout()
-    plt.show()
-    
-    if len(gain_levels) > 1:
-      fig, ax = plt.subplots(figsize=(8, 6))
-      ax.plot(gain_levels, mean_devs, marker='o')
-      ax.set_xlabel('Gain (dB)')
-      ax.set_ylabel('Read noise (counts)')
-
-      plt.show()
-    
-    return mean_devs, bias
-```
-
-## Measuring read noise
-
-```{python}
-#| echo: true
-#| output-location: fragment
-
-gain_levels = [1]
-read_noise_stub = f'{data_dir}read_noise/'
-downsample_by = 5
-
-_ = plot_readout_noise_multiple_gain(gain_levels, read_noise_stub, downsample_by)
-```
-
-## Measuring read noise
-```{python}
-#| echo: true
-#| output-location: fragment
-
-gain_levels = [0, 1, 12, 24]
-# Check which camera recorded the session: the simulator's recordings say "Simulated"
-print(f"Camera: {load_metadata(f'{read_noise_stub}{gain_levels[0]}dB/')['camera_model']}")
-read_noise, read_bias = plot_readout_noise_multiple_gain(gain_levels, read_noise_stub, downsample_by)
-```
+## Switch to the live camera
+`basler_live.py`: **Read noise** tab
 
 ## Read noise results{.smaller}
-- First check that 0% of values are clipped at 0
-- If any are, the black level was too low: the negative fluctuations are cut off and the standard deviation comes out too low
 
 ::: {.fragment}
-| Gain | Bias (counts) | Read noise (counts) |
-|---|---|---|
-| 0 dB | | |
-| 1 dB | | |
-| 12 dB | | |
-| 24 dB | | |
+```{python}
+#| echo: false
+#| output: asis
+
+show_table(
+    ['Gain', 'Bias (counts)', 'Read noise (counts)'],
+    [[f"{r['gain_db']} dB", f"{r['bias']:.1f}", f"{r['read_noise']:.2f}"] for r in results],
+)
+```
 
 :::
 
@@ -208,107 +71,21 @@ read_noise, read_bias = plot_readout_noise_multiple_gain(gain_levels, read_noise
 - Take multiple images with no light at different exposure times
 - Calculate counts per pixel for each exposure time
 
-## Measuring dark noise
-```{python}
-#| echo: true
-def measure_dark_counts(im_data):
-    """
-    Measure the mean dark counts from a stack of images.
-
-    Parameters
-    ----------
-    im_data : np.ndarray
-        Stack of images with shape (num_images, height, width).
-
-    Returns
-    -------
-    dark_counts : np.ndarray
-        Mean counts for each image in the stack.
-    """
-    return np.mean(im_data, axis=(1,2), dtype=np.float32)
-
-def calc_plot_dark_counts(im_data, exposures):
-    """
-    Calculate and plot dark counts against exposure time.
-
-    Parameters
-    ----------
-    im_data : np.ndarray
-        Stack of images with shape (num_images, height, width).
-    exposures : np.ndarray
-        Array of exposure times corresponding to each image in the stack.
-    
-    Returns
-    -------
-    dark_counts : np.ndarray
-        Mean counts for each image in the stack.
-    subtracted_counts : np.ndarray
-        Dark counts with bias subtracted.
-    model_dark_noise : LinearRegression
-        Linear regression model fitted to the dark counts.
-    """
-    dark_counts = measure_dark_counts(im_data)
-    bias = dark_counts[0]
-    subtracted_counts = dark_counts - bias
-    
-    model_dark_noise = LinearRegression()
-    model_dark_noise.fit(exposures.reshape(-1, 1), subtracted_counts)
-    
-    print(f'The slope of the dark noise is {model_dark_noise.coef_}')
-    print(f'The y-intercept of the dark noise is {model_dark_noise.intercept_}')
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(exposures, subtracted_counts, marker='o')
-    ax.set_xlabel('Exposure time (s)')
-    ax.set_ylabel('Mean counts')
-    plt.show()
-    
-    return dark_counts, subtracted_counts, model_dark_noise
-```
-
-## Measuring dark noise
-```{python}
-#| echo: true
-#| output-location: fragment
-
-def load_dark_series(gain_dir):
-    """The mean image at each exposure, and the exposures in seconds from metadata.json."""
-    folders = sorted(glob.glob(gain_dir + '*us/'), key=lambda f: load_metadata(f)['exposure_us'])
-    exposures = np.array([load_metadata(f)['exposure_us'] * 1e-6 for f in folders])
-    images = np.stack([load_tiff_directory(f).mean(axis=0) for f in folders])
-    return images, exposures
-
-dark_count_results = []
-dark_exposures = []
-
-print(f'Dark counts for {gain_levels[0]}dB')
-dark_images, exposures = load_dark_series(f'{data_dir}dark/{gain_levels[0]}dB/')
-dark_exposures.append(exposures)
-dark_count_results.append(calc_plot_dark_counts(dark_images, exposures))
-```
-
-## Measuring dark noise
-```{python}
-#| echo: true
-#| output-location: fragment
-for gain in gain_levels[1:]:
-    print(f'Dark counts for {gain}dB')
-    dark_images, exposures = load_dark_series(f'{data_dir}dark/{gain}dB/')
-    dark_exposures.append(exposures)
-    dark_count_results.append(calc_plot_dark_counts(dark_images, exposures))
-```
+## Switch to the live camera
+`basler_live.py`: **Dark counts** tab
 
 ## Dark noise results{.smaller}
-- Counts are the camera's raw 12-bit values (0-4095)
-- The bias is the mean at the shortest exposure, where dark counts are negligible
 
 ::: {.fragment}
-| Gain | Bias (counts) | Dark counts (counts/pixel/s) |
-|---|---|---|
-| 0 dB | | |
-| 1 dB | | |
-| 12 dB | | |
-| 24 dB | | |
+```{python}
+#| echo: false
+#| output: asis
+
+show_table(
+    ['Gain', 'Bias (counts)', 'Dark counts (counts/pixel/s)'],
+    [[f"{r['gain_db']} dB", f"{r['dark_bias']:.1f}", f"{r['dark_counts_per_s']:.2f}"] for r in results],
+)
+```
 
 :::
 
@@ -323,76 +100,16 @@ $$
 
 :::
 
-## What value do saturated pixels have?
-- The camera records 12-bit values, so full scale is 4095
-- Every recording's metadata.json stores this as `max_value`
-- A recording of a saturated scene confirms it
-
-::: {.fragment}
-```{python}
-#| echo: true
-
-saturated_value = load_metadata(f'{read_noise_stub}{gain_levels[0]}dB/')['max_value']
-print(f'Saturated pixels are assigned the value {saturated_value}')
-
-for path in natsorted(glob.glob(f'{data_dir}saturation/*/')):
-    print(f'{path}: brightest value {int(load_tiff_directory(path).max())}')
-```
-
-:::
-
-## Compute the dynamic range
-```{python}
-#| echo: true
-#| output-location: fragment
-
-# Use 1dB gain and 1 ms exposure
-gain_index = 1
-exposure_index = 1
-
-raw_counts, subtracted_counts, model = dark_count_results[gain_index]
-# bias is the dark count at ~0 exposure time
-bias = raw_counts[0]
-sat_value = saturated_value - bias
-# subtracted dark count for 1 ms exposure
-dark_count = subtracted_counts[exposure_index]
-print(f'Saturation after bias removal at {gain_levels[gain_index]} dB gain is {sat_value:.0f} counts')
-print(f'Dark counts at {dark_exposures[gain_index][exposure_index]*1000:.2f} ms exposure are {dark_count:.2f}')
-
-dynamic_range = (sat_value - dark_count) / read_noise[gain_index]
-
-print(f'The dynamic range of the camera at {gain_levels[gain_index]} dB gain is {dynamic_range:.0f}:1 ({20 * np.log10(dynamic_range):.1f} dB)')
-```
-
-## Compute the dynamic range
-```{python}
-#| echo: true
-#| output-location: fragment
-
-# Use the highest gain level and 1 ms exposure
-gain_index = -1
-exposure_index = 1
-raw_counts, subtracted_counts, model = dark_count_results[gain_index]
-# bias is the dark count at ~0 exposure time
-bias = raw_counts[0]
-sat_value = saturated_value - bias
-# subtracted dark count for 1 ms exposure
-dark_count = subtracted_counts[exposure_index]
-print(f'Saturation after bias removal at {gain_levels[gain_index]} dB gain is {sat_value:.0f} counts')
-print(f'Dark counts at {dark_exposures[gain_index][exposure_index]*1000:.2f} ms exposure are {dark_count:.2f}')
-
-dynamic_range = (sat_value - dark_count) / read_noise[gain_index]
-
-print(f'The dynamic range of the camera at {gain_levels[gain_index]} dB gain is {dynamic_range:.0f}:1 ({20 * np.log10(dynamic_range):.1f} dB)')
-```
-
 ## Dynamic range results
-| Gain | Dynamic range | Dynamic range (dB) |
-|---|---|---|
-| 0 dB | | |
-| 1 dB | | |
-| 12 dB | | |
-| 24 dB | | |
+```{python}
+#| echo: false
+#| output: asis
+
+show_table(
+    ['Gain', 'Dynamic range', 'Dynamic range (dB)'],
+    [[f"{r['gain_db']} dB", f"{r['dynamic_range']:.0f}:1", f"{r['dynamic_range_db']:.1f}"] for r in results],
+)
+```
 
 - Dynamic range is highest at the lowest gain
 - Increasing the gain raises read noise in counts, while the digitizer's maximum value stays fixed
@@ -570,200 +287,46 @@ $$
 Therefore we can plot the variance of image values against the mean image value, and the slope of the line will give us the gain alpha, while the y-intercept will give us the variance of the read noise in units of gray levels.
 :::
 
-## Estimating gain using shot noise
-```{python}
-#| echo: true
+## Recording shot noise {.smaller}
+- Light the camera unevenly, so the image runs from dark to saturated
+- Each pixel sees a different brightness, so one stack of 100 frames covers the whole range
+- Record a stack at each gain, scaling the exposure so the image stays about as bright
+- Subtract the bias measured in the read noise section, at the same gain and black level
+- Leave out pixels that read 0 or saturate in any frame: they are clipped, so their variance is too low
+- Near saturation the wells fill up and the variance stops growing, so fit only below 70% of the mean where the variance peaks
 
-def check_frames(directory_path: str):
-    """
-    Check that the camera reported no missing or repeated frames.
-
-    Parameters
-    ----------
-    directory_path : str
-        Path to the recording.
-
-    Returns
-    -------
-    metadata : dict
-        The recording's metadata.json.
-    """
-    meta = load_metadata(directory_path)
-    assert meta['missing_frames'] == 0 and meta['repeated_frames'] == 0, f'{directory_path}: frames were dropped or repeated'
-    return meta
-
-def measure_shot_noise(image_path: str, dark_path: str):
-    """
-    Measure the mean and variance of each pixel across a movie.
-
-    Parameters
-    ----------
-    image_path : str
-        Path to the directory containing shot noise images.
-    dark_path : str
-        Path to a dark stack recorded at the same settings. Its per-pixel mean
-        removes the bias, the fixed pattern and the dark counts.
-
-    Returns
-    -------
-    mean : np.ndarray
-        Mean of each pixel with shape (num_pixels, 1).
-    var : np.ndarray
-        Variance of each pixel with shape (num_pixels, 1).
-    """
-    check_frames(image_path)
-    offset = np.mean(load_tiff_directory(dark_path), axis=0)
-    shot_image = load_tiff_directory(image_path) - offset
-
-    # Rescale each frame to the same mean so that frame-to-frame changes in the
-    # illumination are not counted as shot noise.
-    frame_means = np.mean(shot_image, axis=(1, 2), dtype=np.float64)
-    print(f'{shot_image.shape[0]} frames, frame means vary by {np.std(frame_means, ddof=1) / np.mean(frame_means):.2%}')
-    shot_image = shot_image / (frame_means / np.mean(frame_means)).reshape(-1, 1, 1).astype(np.float32)
-
-    mean = np.mean(shot_image, axis=0, dtype=np.float32).reshape(-1, 1)
-    var = np.var(shot_image, axis=0, ddof=1, dtype=np.float32).reshape(-1, 1)
-
-    return mean, var
-
-def calculate_plot_shot_noise(image_path: str, dark_path: str, downsample:int = 5):
-    """
-    Calculate and plot shot noise to estimate camera gain.
-
-    Parameters
-    ----------
-    image_path : str
-        Path to the directory containing shot noise images.
-    dark_path : str
-        Path to the dark stack recorded at the same settings.
-    downsample : int, optional
-        Factor by which to downsample the images for faster computation.
-    """
-    mean, var = measure_shot_noise(image_path, dark_path)
-    
-    model = LinearRegression()
-    model.fit(mean, var)
-
-    # The intercept is an extrapolation, so check how much it depends on the fit range
-    dim_pixels = mean[:, 0] < 0.35 * mean.max()
-    model_dim = LinearRegression()
-    model_dim.fit(mean[dim_pixels], var[dim_pixels])
-    
-    best_fit = model.predict(mean)
-        
-    print(f'The gain of the camera is {model.coef_[0][0]:.3f} counts/e-')
-    print(f'The y-intercept is {model.intercept_[0]:.3f}')
-    print(f'Fitting the dimmest pixels only, the gain is {model_dim.coef_[0][0]:.3f} counts/e- and the y-intercept is {model_dim.intercept_[0]:.3f}')
-    print(f'The dimmest pixel has a mean of {mean.min():.0f} counts')
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.scatter(mean[::downsample], var[::downsample])
-    ax.plot(mean, best_fit, color='r', linestyle='--')
-    ax.set_xlabel('Mean counts')
-    ax.set_ylabel('Variance')
-    
-    plt.show()
-
-    return model.coef_[0][0], model.intercept_[0]
-```
-
-## Estimating gain using shot noise
-```{python}
-#| echo: true
-#| output-location: fragment
-
-# Each lit recording shot/<label>/ is paired with shot/<label>_dark/, taken at the same settings
-shot_paths = natsorted(p for p in glob.glob(f'{data_dir}shot/*/') if not p.rstrip('/').endswith('_dark'))
-shot_results = []
-
-for path in shot_paths:
-    meta = load_metadata(path)
-    print(f"Shot noise for {meta['label']}: {meta['gain']:g} dB, {meta['exposure_us'] / 1000:g} ms exposure")
-    gain, intercept = calculate_plot_shot_noise(path, path.rstrip('/') + '_dark/')
-    shot_results.append({'path': path, 'gain_db': meta['gain'], 'counts_per_e': gain, 'intercept': intercept})
-```
-
-## Converting to electrons
-```{python}
-#| echo: true
-#| output-location: fragment
-
-shot_gain_db = shot_results[0]['gain_db']
-# The camera reads its gain back to its own step size (e.g. 11.99 dB for 12), so match the nearest setting
-gain_index = int(np.argmin(np.abs(np.array(gain_levels) - shot_gain_db)))
-assert abs(gain_levels[gain_index] - shot_gain_db) < 0.1, 'record read noise and dark counts at the shot noise gain too'
-same_gain = [r for r in shot_results if abs(r['gain_db'] - shot_gain_db) < 0.1]
-camera_gain = np.mean([r['counts_per_e'] for r in same_gain])
-print(f"Gain at {shot_gain_db:g} dB is {camera_gain:.3f} counts/e-, or {1 / camera_gain:.2f} e- per count")
-
-readout_noise_e = read_noise[gain_index] / camera_gain
-print(f"Read noise in e- for {shot_gain_db:g} dB is: {readout_noise_e:.3f}")
-
-for r in same_gain:
-    implied = np.sqrt(r['intercept']) if r['intercept'] > 0 else np.nan
-    print(f"Read noise implied by the y-intercept is {implied:.2f} counts ({implied / camera_gain:.2f} e-), "
-          f"compared to {read_noise[gain_index]:.2f} counts measured directly")
-
-dark_rate = dark_count_results[gain_index][2].coef_[0]
-print(f"Dark counts at {shot_gain_db:g} dB are {dark_rate:.2f} counts/pixel/s, or {dark_rate / camera_gain:.2f} e-/pixel/s")
-```
-
-## Checks on the shot noise data
-- The camera numbers its frames, so missing or repeated frames are caught when recording: they are not independent measurements
-- If the frame means vary, the illumination was not perfectly stable
-- We rescale each frame, otherwise the extra variance inflates the slope
-- The dark stack at identical settings removes the bias exactly, so no offset has to be guessed
+## Switch to the live camera
+`basler_live.py`: **Shot noise** tab
 
 ## Does the gain follow the nominal gain?
 ```{python}
-#| echo: true
-#| output-location: fragment
+#| echo: false
 
-# With shot noise recorded at several gains, the measured gain should follow the nominal 10^(dB/20)
-for r in shot_results:
-    print(f"{r['gain_db']:g} dB: {r['counts_per_e']:.3f} counts/e-, "
-          f"implying {r['counts_per_e'] / 10 ** (r['gain_db'] / 20):.3f} counts/e- at 0 dB")
-```
-
-## Where does the fit line intersect the y-axis?{.smaller}
-- We expect the read noise variance, measured directly in the first section
-
-::: {.fragment}
-| Fit | Intercept (counts$^2$) | Read noise$^2$ measured directly (counts$^2$) |
-|---|---|---|
-| All pixels | | |
-| Dimmest pixels only | | |
-
-:::
-
-- The intercept is an extrapolation: the further the dimmest pixel is from 0, the less precise it is
-- If variance is not perfectly linear in the mean, a small slope change shifts the intercept a lot
-- The direct measurement from the dark stack is the one to trust
-
-## Comparison with the specification sheet
-```{python}
-#| echo: true
-#| output-location: fragment
-
-# Nominal gain at 0 dB, assuming the gain setting in dB is exact
-gain_0db = camera_gain / 10 ** (shot_gain_db / 20)
-raw_counts, subtracted_counts, _ = dark_count_results[0]
-sat_0db = saturated_value - raw_counts[0]
-dynamic_range_0db = (sat_0db - subtracted_counts[1]) / read_noise[0]
-
-print(f'Gain {gain_0db:.2f} counts/e-')
-print(f'Read noise {read_noise[0] / gain_0db:.2f} e-')
-print(f'Saturation {sat_0db / gain_0db:.0f} e-')
-print(f'Dynamic range {dynamic_range_0db:.0f}:1 ({20 * np.log10(dynamic_range_0db):.1f} dB)')
+# The measured gain should follow the nominal 10^(dB/20), relative to the lowest gain
+fig, ax = plt.subplots(figsize=(11.5, 5))
+ax.semilogy(gain_levels, camera_gain, marker='o', linestyle='none', label='measured')
+ax.semilogy(gain_levels, camera_gain[0] * 10 ** ((gain_levels - gain_levels[0]) / 20), linestyle='--', label='nominal')
+ax.set_xlabel('Gain (dB)')
+ax.set_ylabel('Gain (counts/e-)')
+ax.set_title('From a previous run')
+ax.legend()
+plt.show()
 ```
 
 ## Comparison with the specification sheet{.smaller}
-| Quantity at 0 dB | Measured | Specification |
-|---|---|---|
-| Read noise | | 6.9 e- |
-| Saturation | | 32.8 ke- |
-| Dynamic range | | 73.5 dB |
+```{python}
+#| echo: false
+#| output: asis
 
-- Specification values are EMVA 1288 figures listed by [a reseller](https://ww2.avsupply.com/ITM/31548/aca1920-40um.html), not a Basler document
-- Saturation only reflects the full well capacity at low gain
-- At higher gain the digitizer reaches its maximum first
+r = results[0]
+show_table(
+    ['Quantity at 0 dB', 'Measured', 'Specification'],
+    [
+        ['Read noise', f"{r['read_noise'] / r['counts_per_e']:.1f} e-", '2 e-'],
+        ['Saturation', f"{r['saturation'] / r['counts_per_e'] / 1000:.1f} ke-", '10.2 ke-'],
+        ['Dynamic range', f"{r['dynamic_range_db']:.1f} dB", '73 dB'],
+    ],
+)
+```
+
+- Specification values are [Basler's EMVA 1288 figures](https://assets-ctf.baslerweb.com/dg51pdwahxgw/1hcLdj4BXRUzhnOL2gaNIm/faa0fa7fe5ea641aca3c3be7efe82c24/BAS2606_EMVA_Data_Overview_A4_EN_SAP0136_No_18.pdf) for the IMX304, the sensor in our acA4112-20um

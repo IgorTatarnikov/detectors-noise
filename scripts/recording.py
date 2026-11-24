@@ -3,8 +3,7 @@
     data/live/<YYYYMMDD-HHMMSS>/
       read_noise/<gain>dB/            frame_0000.tif ... metadata.json
       dark/<gain>dB/<exposure>us/
-      shot/<label>/                   illuminated
-      shot/<label>_dark/              paired dark stack at identical settings
+      shot/<gain>dB/                  unevenly illuminated, exposure scaled with gain
       saturation/<label>/
       results.json
 
@@ -61,8 +60,11 @@ class RecordingWriter:
     camera run out of buffers and drop frames.
     """
 
-    def __init__(self, path: Path, metadata: dict, analysis_step: int = 1):
+    def __init__(self, path: Path, metadata: dict, analysis_step: int = 1, continuous: bool = True):
+        """`continuous` is False when the frames are not consecutive, as in an interleaved
+        recording, so gaps in the camera's frame counter are expected, not dropped frames."""
         self.path = Path(path)
+        self.continuous = continuous
         if self.path.exists() and any(self.path.glob("*.tif")):
             raise FileExistsError(f"{self.path} already has a recording")
         self.path.mkdir(parents=True, exist_ok=True)
@@ -106,7 +108,7 @@ class RecordingWriter:
         self._thread.join()
         if self._error is not None:
             raise self._error
-        missing, repeated = check_block_ids(self.block_ids)
+        missing, repeated = check_block_ids(self.block_ids) if self.continuous else (0, 0)
         self.metadata.update(extra)
         self.metadata.update(
             frames=len(self.block_ids),

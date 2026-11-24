@@ -6,12 +6,15 @@
     .venv/bin/python scripts/sipm_daq_live.py --simulate      # no hardware
     .venv/bin/python scripts/sipm_daq_live.py --open data/sipm_live/practical
 
-Left: the live trace and 10 ms block means, with the fraction of samples above the
+The first tab, Live, is just the live trace and 10 ms block means with the bias step, to
+try the detector out. It records nothing.
+
+The other tabs keep that on the left, with the fraction of samples above the
 baseline code, how many of those are only one code tall, and the fraction clipped.
 The bias knob can't be read by the computer, so set "Bias step" to match it; every
 recording stores it.
 
-Right: one tab per section of the practical. Each recording is saved as codes.npy
+There is one tab per section of the practical, on the right. Each recording is saved as codes.npy
 plus metadata.json under the session folder (see sipm_daq_analysis.py for the method):
   Read noise     detector unplugged: the baseline and the spread of single samples
   Dark           SiPM covered, at each bias step: mean and variance of the samples
@@ -35,7 +38,7 @@ import numpy as np
 
 import sipm_daq_analysis as sa
 from daq_live import BlockAverager, Reader, RingBuffer
-from live_widgets import color, fill_table, format_duration, parse_numbers, plot_widget, table, unique_path
+from live_widgets import PracticalView, color, fill_table, format_duration, parse_numbers, plot_widget, table, unique_path
 from recording import new_session, write_json
 from usb201 import MAX_RATE
 
@@ -528,21 +531,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.restarts = 0
         self.setWindowTitle(f"SiPM noise practical: USB-201 {self.serial} Ch{channel} @ {self.rate:.0f} S/s")
 
-        splitter = QtWidgets.QSplitter()
-        self.setCentralWidget(splitter)
-        splitter.addWidget(self._live_panel())
-        right = QtWidgets.QWidget()
-        rl = QtWidgets.QVBoxLayout(right)
-        self.tabs = QtWidgets.QTabWidget()
+        live = self._live_panel()
         self.read_tab = ReadTab(self)
         self.gain_tab = GainTab(self)
         self.dark_tab = DarkTab(self)
         self.dr_tab = DynamicRangeTab(self)
-        self.tabs.addTab(self.read_tab, "Read noise")
-        self.tabs.addTab(self.dark_tab, "Dark")
-        self.tabs.addTab(self.dr_tab, "Dynamic range")
-        self.tabs.addTab(self.gain_tab, "Gain")
-        rl.addWidget(self.tabs)
         bar = QtWidgets.QHBoxLayout()
         self.progress = QtWidgets.QProgressBar()
         self.cancel_button = QtWidgets.QPushButton("Cancel")
@@ -550,9 +543,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cancel_button.clicked.connect(self.cancel)
         bar.addWidget(self.progress, 1)
         bar.addWidget(self.cancel_button)
-        rl.addLayout(bar)
-        splitter.addWidget(right)
-        splitter.setSizes([700, 900])
+        self.view = PracticalView(
+            live,
+            [
+                ("Read noise", self.read_tab),
+                ("Dark", self.dark_tab),
+                ("Dynamic range", self.dr_tab),
+                ("Gain", self.gain_tab),
+            ],
+            bar,
+            self.session_buttons,
+        )
+        self.setCentralWidget(self.view)
         self.statusBar().showMessage(f"Session: {session}")
 
         self.timer = QtCore.QTimer()
@@ -574,7 +576,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _live_panel(self):
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
-        plots = pg.GraphicsLayoutWidget()
+        self.plots = plots = pg.GraphicsLayoutWidget()
         plots.setBackground("w")
         self.p_trace = plots.addPlot(row=0, col=0, title=f"Trace, last {TRACE_S:g} s")
         self.p_trace.setLabels(left="mV", bottom="time (s)")
@@ -621,7 +623,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(new)
         row.addWidget(opened)
         layout.addLayout(row)
-        self.controls = [self.bias, new, opened]
+        self.session_buttons = [new, opened]
+        self.controls = [self.bias, *self.session_buttons]
         return panel
 
     def on_bias(self, value):

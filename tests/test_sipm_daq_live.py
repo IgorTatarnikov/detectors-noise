@@ -83,3 +83,30 @@ def test_full_session_with_simulator(tmp_path):
         assert win2.gain_tab.fit["h_eff_mv"] == pytest.approx(fit["h_eff_mv"])
     finally:
         close_window(win2)
+
+
+def test_starts_with_only_the_live_view_and_its_controls(tmp_path):
+    app = pg.mkQApp()
+    win = MainWindow(SimulatedDAQ(seed=3), 7, 100_000, tmp_path / "s", simulate=True)
+    try:
+        win.show()
+        app.processEvents()
+        assert win.view.titles() == ["Live", "Read noise", "Dark", "Dynamic range", "Gain"]
+        assert win.plots.isVisible() and win.bias.isVisible()
+        hidden = [win.read_tab, win.progress, win.cancel_button, *win.session_buttons]
+        assert not any(w.isVisible() for w in hidden)
+
+        win.view.select("Dark")
+        app.processEvents()
+        assert win.dark_tab.isVisible() and not win.read_tab.isVisible()
+        assert win.plots.isVisible() and win.bias.isVisible()
+        assert all(w.isVisible() for w in hidden[1:])
+        # both sides get a usable share of the window
+        assert min(win.view.splitter.sizes()) > 0.25 * win.width()
+
+        win.view.select("Live")  # and back again
+        app.processEvents()
+        assert win.plots.isVisible()
+        assert not any(w.isVisible() for w in [win.dark_tab, *hidden])
+    finally:
+        close_window(win)

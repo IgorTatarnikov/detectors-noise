@@ -5,16 +5,19 @@
     .venv/bin/python scripts/basler_live.py --simulate   # no hardware: a simulated camera
     .venv/bin/python scripts/basler_live.py --open data/live/practical   # record into (or re-analyse) this folder
 
-Left: the live image with black level (bias), gain and exposure controls, and the
-fraction of pixels at 0 or saturated. Keep both at 0% for every recording except
-the saturation one.
+The first tab, Live, is just the live image with black level (bias), gain and exposure
+controls, to try the camera out. It records nothing.
 
-Right: one tab per section of the practical. Each tab records what it needs into
+The other tabs keep that on the left, with the fraction of pixels at 0 or saturated. The
+app reports these numbers but doesn't judge them: a recording that goes wrong, such as read
+noise clipped at 0, is left for the students to notice and discuss.
+
+There is one tab per section of the practical. Each tab, on the right, records what it needs into
 the session folder (TIFFs plus metadata.json, see recording.py) and shows the result:
   Read noise     covered, minimum exposure, a stack per gain
   Dark counts    covered, a stack per exposure and gain, fit of counts against time
   Dynamic range  from the other two tabs, and optionally a saturated frame
-  Shot noise     lit stack plus a covered stack at the same settings; variance against mean
+  Shot noise     an unevenly lit stack per gain, bias from Read noise; variance against mean
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import numpy as np
 import noise_analysis as na
 from basler_camera import SETTINGS, camera_metadata, open_camera
 from live_widgets import (
+    PracticalView,
     color,
     fill_table,
     format_duration,
@@ -58,10 +62,11 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=True)
 
 LIVE_EMIT_S = 0.05
-# A black level of 0 clips the negative half of the read noise, so start above it.
-DEFAULT_BLACK_LEVEL = 64
 MAX_SCATTER = 20_000
-WARN_FRACTION = 1e-3
+# Seconds of frames thrown away after each settings change, and always at least one
+# frame. At short exposures an acA4112-20um's offset sat 2 counts away for about 0.5 s
+# after a change. Counting frames instead would waste 10 exposures at 10 s each.
+SETTLE_S = 1.0
 
 
 # --------------------------------------------------------------------------- jobs
@@ -81,6 +86,8 @@ class Job:
     name: str
     steps: list[Step]
     keep_stack: bool = True
+    # Record one frame per visit, ramping through the exposures and back (see visit_order)
+    interleave: bool = False
 
 
 @dataclass
@@ -99,11 +106,47 @@ def live_stats(image: np.ndarray, max_value: int) -> dict:
     }
 
 
-def estimate_seconds(steps: list[Step], max_fps: float = 40.0) -> float:
-    total = 0.0
-    for s in steps:
-        period = max(s.settings.get("exposure_us", 0) * 1e-6, 1 / max_fps)
-        total += (s.frames + 1) * period + 0.3
+def _group(step: Step) -> tuple:
+    """Settings other than the exposure: steps that share them are interleaved together."""
+    return tuple(sorted((k, v) for k, v in step.settings.items() if k != "exposure_us"))
+
+
+def visit_order(steps: list[Step]) -> list[tuple[int, int]]:
+    """(step index, pass) for each frame of an interleaved recording.
+
+    Steps with the same settings apart from exposure form a group. Each pass records one
+    frame at every exposure, shortest first on even passes and longest first on odd ones,
+    so the exposures ramp up and back down and a steady drift affects each one equally.
+    The exposure at each turn is visited twice in a row, without changing settings.
+    """
+    order = []
+    groups: dict[tuple, list[int]] = {}
+    for i, s in enumerate(steps):
+        groups.setdefault(_group(s), []).append(i)
+    for members in groups.values():
+        members = sorted(members, key=lambda i: steps[i].settings.get("exposure_us", 0))
+        for p in range(max(steps[i].frames for i in members)):
+            for i in members if p % 2 == 0 else reversed(members):
+                if p < steps[i].frames:
+                    order.append((i, p))
+    return order
+
+
+def estimate_seconds(steps: list[Step], max_fps: float = 40.0, interleave: bool = False) -> float:
+    def period(s: Step) -> float:
+        return max(s.settings.get("exposure_us", 0) * 1e-6, 1 / max_fps)
+
+    if not interleave:
+        return sum(s.frames * period(s) + max(period(s), SETTLE_S) + 0.3 for s in steps)
+    total, last = 0.0, None
+    for i, _ in visit_order(steps):
+        s = steps[i]
+        if last is None or _group(steps[last]) != _group(s):
+            total += max(period(s), SETTLE_S) + 0.3  # a new gain: settle fully
+        elif last != i:
+            total += period(s) + 0.05  # a new exposure: one frame thrown away
+        total += period(s)
+        last = i
     return total
 
 
@@ -195,42 +238,96 @@ class CameraWorker(QtCore.QThread):
             except Exception:
                 pass
 
-    def _run_job(self, job: Job):
-        self.cancel.clear()
-        restore = self.cam.settings()
+    def _apply(self, settings: dict):
+        self.cam.stop()  # empty the buffers, so no frame from the old settings is kept
+        for key in SETTINGS:
+            if key in settings:
+                self.cam.set(key, settings[key])
+        self.settings_changed.emit(self.cam.settings())
+        self.cam.start()
+
+    def _settle(self, seconds: float):
+        """Throw away frames for `seconds`, and always at least one."""
+        start = time.monotonic()
+        settled = 0
+        while settled == 0 or time.monotonic() - start < seconds:
+            if self.cancel.is_set():
+                raise InterruptedError
+            self.cam.grab(self._timeout())
+            settled += 1
+
+    def _grab_one(self):
+        while True:
+            if self.cancel.is_set():
+                raise InterruptedError
+            try:
+                return self.cam.grab(self._timeout())
+            except InterruptedError:
+                raise
+            except Exception:
+                continue
+
+    def _writer(self, step: Step, **options) -> RecordingWriter:
+        meta = {**step.metadata, **camera_metadata(self.cam), "analysis_step": self.analysis_step}
+        return RecordingWriter(step.path, meta, analysis_step=self.analysis_step, **options)
+
+    def _run_grouped(self, job: Job) -> list[Recording]:
         results = []
         total = sum(s.frames for s in job.steps)
         done = 0
-        try:
-            for step in job.steps:
-                self.cam.stop()  # empty the buffers, so no frame from the old settings is kept
-                for key in SETTINGS:
-                    if key in step.settings:
-                        self.cam.set(key, step.settings[key])
-                actual = self.cam.settings()
-                self.settings_changed.emit(actual)
-                self.cam.start()
-                self.cam.grab(self._timeout())  # discard the first frame after a change
-                meta = {**step.metadata, **camera_metadata(self.cam), "analysis_step": self.analysis_step}
-                writer = RecordingWriter(step.path, meta, analysis_step=self.analysis_step)
-                grabbed = 0
-                while grabbed < step.frames:
-                    if self.cancel.is_set():
-                        writer.close(cancelled=True)
-                        raise InterruptedError
-                    try:
-                        f = self.cam.grab(self._timeout())
-                    except InterruptedError:
-                        raise
-                    except Exception:
-                        continue
+        for step in job.steps:
+            self._apply(step.settings)
+            self._settle(SETTLE_S)
+            writer = self._writer(step)
+            try:
+                for _ in range(step.frames):
+                    f = self._grab_one()
                     writer.add(f.image, f.block_id, f.timestamp)
-                    grabbed += 1
                     done += 1
                     self._emit_live(f.image)
                     self.progress.emit(f"{job.name}: {step.path.name}", done, total)
-                meta = writer.close(cancelled=False)
-                results.append(Recording(step.path, meta, writer.stack() if job.keep_stack else None))
+            except InterruptedError:
+                writer.close(cancelled=True)
+                raise
+            meta = writer.close(cancelled=False)
+            results.append(Recording(step.path, meta, writer.stack() if job.keep_stack else None))
+        return results
+
+    def _run_interleaved(self, job: Job) -> list[Recording]:
+        order = visit_order(job.steps)
+        writers: dict[int, RecordingWriter] = {}
+        passes: dict[int, list[int]] = {}
+        last = None
+        try:
+            for done, (i, p) in enumerate(order, start=1):
+                step = job.steps[i]
+                if last != i:
+                    self._apply(step.settings)
+                    new_group = last is None or _group(job.steps[last]) != _group(step)
+                    self._settle(SETTLE_S if new_group else 0.0)
+                if i not in writers:
+                    writers[i] = self._writer(step, continuous=False)
+                f = self._grab_one()
+                writers[i].add(f.image, f.block_id, f.timestamp)
+                passes.setdefault(i, []).append(p)
+                last = i
+                self._emit_live(f.image)
+                self.progress.emit(f"{job.name}: {step.path.name}, pass {p + 1}", done, len(order))
+        except InterruptedError:
+            for i, w in writers.items():
+                w.close(cancelled=True, order="interleaved", passes=passes.get(i, []))
+            raise
+        results = []
+        for i, step in enumerate(job.steps):
+            meta = writers[i].close(cancelled=False, order="interleaved", passes=passes[i])
+            results.append(Recording(step.path, meta, writers[i].stack() if job.keep_stack else None))
+        return results
+
+    def _run_job(self, job: Job):
+        self.cancel.clear()
+        restore = self.cam.settings()
+        try:
+            results = self._run_interleaved(job) if job.interleave else self._run_grouped(job)
             self.recorded.emit(job.name, results)
         except InterruptedError:
             self.failed.emit(job.name, "Recording cancelled. The partial recording is marked cancelled in its metadata.")
@@ -292,10 +389,13 @@ class SectionTab(QtWidgets.QWidget):
         except (ValueError, AttributeError):
             self.estimate.setText("")
             return
-        self.estimate.setText(f"{len(steps)} stack(s), about {format_duration(estimate_seconds(steps))}")
+        self.estimate.setText(f"{len(steps)} stack(s), about {format_duration(estimate_seconds(steps, interleave=self.interleaved()))}")
 
     def steps(self) -> list[Step]:
         return []
+
+    def interleaved(self) -> bool:
+        return False
 
     def record(self):
         raise NotImplementedError
@@ -310,7 +410,7 @@ class ReadNoiseTab(SectionTab):
             win,
             "Cover the camera. Records a stack at the minimum exposure for each gain, at the current "
             "black level. Read noise is the average over pixels of each pixel's standard deviation "
-            "across the stack. Keep the black level high enough that no pixel reads 0.",
+            "across the stack.",
         )
         self.gain_edit = QtWidgets.QLineEdit("0, 1, 12, 24")
         self.current_only = QtWidgets.QCheckBox("current gain only")
@@ -329,7 +429,7 @@ class ReadNoiseTab(SectionTab):
         self.vs_gain = plot_widget("Read noise against gain", f"gain ({win.cam.gain_unit})", "read noise (counts)")
         self.plots.addWidget(self.hist)
         self.plots.addWidget(self.vs_gain)
-        self.table = table(["Gain", "Black level", "Bias", "Read noise", "% at 0", "Frames", "Missing", "Folder"])
+        self.table = table(["Gain", "Black level", "Bias", "Read noise", "% at 0", "Frames used", "Missing", "Folder"])
         self.body.addWidget(self.table, 2)
         self.by_key: dict[tuple, dict] = {}
         self.update_estimate()
@@ -363,21 +463,14 @@ class ReadNoiseTab(SectionTab):
                 "read_noise": result.read_noise,
                 "frac_zero": result.frac_zero,
                 "frames": m["frames"],
+                "frames_used": result.frames,
                 "missing": m["missing_frames"] + m["repeated_frames"],
                 "path": str(rec.path),
-                "std": na.per_pixel_std(rec.stack).ravel(),
+                "std": result.pixel_std.ravel(),
             }
         self.redraw()
         last = self.by_key[setting_key(recordings[-1].metadata["gain"], recordings[-1].metadata["black_level"])]
-        clipped = [r for r in self.by_key.values() if r["frac_zero"] > WARN_FRACTION]
-        if clipped:
-            self.say(
-                f"{len(clipped)} stack(s) have pixels at 0, so their read noise is too low. "
-                "Raise the black level and record again.",
-                warn=True,
-            )
-        else:
-            self.say(f"Read noise at {last['gain']:g} {self.win.cam.gain_unit}: {last['read_noise']:.3f} counts.")
+        self.say(f"Read noise at {last['gain']:g} {self.win.cam.gain_unit}: {last['read_noise']:.3f} counts.")
         self.win.results_changed()
 
     def redraw(self):
@@ -385,10 +478,9 @@ class ReadNoiseTab(SectionTab):
         fill_table(
             self.table,
             [
-                [r["gain"], r["black_level"], r["bias"], r["read_noise"], 100 * r["frac_zero"], r["frames"], r["missing"], Path(r["path"]).name]
+                [r["gain"], r["black_level"], r["bias"], r["read_noise"], 100 * r["frac_zero"], r["frames_used"], r["missing"], Path(r["path"]).name]
                 for r in rows
             ],
-            {i for i, r in enumerate(rows) if r["frac_zero"] > WARN_FRACTION or r["missing"]},
         )
         self.hist.clear()
         for i, r in enumerate(rows[-4:]):
@@ -402,6 +494,12 @@ class ReadNoiseTab(SectionTab):
 
     def lookup(self, gain, black_level) -> dict | None:
         return self.by_key.get(setting_key(gain, black_level))
+
+    def lookup_nearest(self, gain, black_level) -> dict | None:
+        """The result at a requested gain, which the camera may read back as e.g. 11.99 for 12."""
+        tol = max(0.1, self.win.cam.limits["gain"][2] or 0.0)  # a camera may report no increment
+        near = [r for r in self.by_key.values() if math.isclose(r["black_level"], black_level) and abs(r["gain"] - gain) <= tol]
+        return min(near, key=lambda r: abs(r["gain"] - gain)) if near else None
 
     def results(self):
         return [{k: v for k, v in r.items() if k != "std"} for r in self.by_key.values()]
@@ -421,10 +519,21 @@ class DarkTab(SectionTab):
         row.addWidget(self.gain_edit)
         row.addWidget(self.current_only)
         self.form.addRow(f"Gains ({win.cam.gain_unit})", row)
-        self.exposure_edit = QtWidgets.QLineEdit("0.04, 1, 10, 100, 1000, 10000")
+        self.exposure_edit = QtWidgets.QLineEdit("0.04, 1, 10, 100, 1000")
         self.form.addRow("Exposures (ms)", self.exposure_edit)
         self.frames = QtWidgets.QSpinBox(minimum=1, maximum=10_000, value=10)
         self.form.addRow("Frames per exposure", self.frames)
+        self.order = QtWidgets.QComboBox()
+        self.order.addItems(
+            ["grouped: all frames at one exposure, then the next", "interleaved: one frame per exposure, ramping up and back down"]
+        )
+        self.order.setToolTip(
+            "Interleaved spreads each exposure's frames over the whole recording. If the offset drifts with "
+            "time, every exposure sees the same drift; if it depends on the exposure, each exposure reads the "
+            "same on every pass. The plot of frame means over time shows which."
+        )
+        self.order.currentIndexChanged.connect(self.update_estimate)
+        self.form.addRow("Order", self.order)
         self.log_x = QtWidgets.QCheckBox("log exposure axis")
         self.form.addRow("", self.log_x)
         for w in (self.gain_edit, self.exposure_edit):
@@ -435,10 +544,19 @@ class DarkTab(SectionTab):
 
         self.plot = plot_widget("Dark counts against exposure", "exposure (s)", "mean counts − bias")
         self.plots.addWidget(self.plot)
+        over_time = QtWidgets.QVBoxLayout()
+        self.series_choice = QtWidgets.QComboBox()
+        self.series_choice.currentIndexChanged.connect(self.redraw_series)
+        over_time.addWidget(self.series_choice)
+        self.time_plot = plot_widget("Frame means over time", "time since first frame (s)", "frame mean (counts)")
+        over_time.addWidget(self.time_plot)
+        self.plots.addLayout(over_time)
         self.table = table(["Gain", "Black level", "Bias", "Dark (counts/px/s)", "Intercept", "Dark (e⁻/px/s)", "Stacks"])
         self.body.addWidget(self.table, 2)
         # (gain, black_level) -> {exposure_s: (mean, path)}
         self.points: dict[tuple, dict[float, tuple[float, str]]] = {}
+        # (gain, black_level) -> {exposure_s: (timestamps in s, frame means)}
+        self.series: dict[tuple, dict[float, tuple[np.ndarray, np.ndarray]]] = {}
         self.fits: dict[tuple, na.DarkFit] = {}
         self.update_estimate()
 
@@ -463,16 +581,26 @@ class DarkTab(SectionTab):
 
     def record(self):
         if self.win.prompt("cover", "Cover the camera so no light reaches the sensor."):
-            self.win.submit(Job("dark", self.steps(), keep_stack=False), self.on_recorded)
+            self.win.submit(Job("dark", self.steps(), keep_stack=False, interleave=self.interleaved()), self.on_recorded)
+
+    def interleaved(self) -> bool:
+        return self.order.currentIndex() == 1
 
     def on_recorded(self, recordings: list[Recording]):
         for rec in recordings:
             m = rec.metadata
             key = setting_key(m["gain"], m["black_level"])
-            self.points.setdefault(key, {})[m["exposure_us"] * 1e-6] = (float(np.mean(m["frame_means"])), str(rec.path))
+            # The mean of the longest run of frames without an offset jump
+            means = np.asarray(m["frame_means"])
+            steady = na.steady_frames(means)
+            self.points.setdefault(key, {})[m["exposure_us"] * 1e-6] = (float(means[steady].mean()), str(rec.path))
+            stamps = np.asarray(m.get("timestamps", []), dtype=np.float64) * 1e-9  # camera clock, ns
+            if stamps.size == means.size:
+                self.series.setdefault(key, {})[m["exposure_us"] * 1e-6] = (stamps, means)
         self.fits = {
             key: na.dark_counts(list(pts), [v[0] for v in pts.values()]) for key, pts in self.points.items() if len(pts) >= 2
         }
+        self.refresh_series_choice(setting_key(recordings[-1].metadata["gain"], recordings[-1].metadata["black_level"]))
         self.redraw()
         self.say("Dark count fits updated." if self.fits else "Record at least two exposures to fit a line.")
         self.win.results_changed()
@@ -491,6 +619,36 @@ class DarkTab(SectionTab):
             k = self.win.shot_tab.gain_for(gain, bl)
             rows.append([gain, bl, fit.bias, fit.slope, fit.intercept, fit.slope / k if k else math.nan, len(x)])
         fill_table(self.table, rows)
+
+    def refresh_series_choice(self, select: tuple | None = None):
+        current = select or self.series_choice.currentData()
+        keys = sorted(self.series)
+        self.series_choice.blockSignals(True)
+        self.series_choice.clear()
+        for gain, bl in keys:
+            self.series_choice.addItem(f"{gain:g} {self.win.cam.gain_unit}, black level {bl:g}", (gain, bl))
+        if current in keys:
+            self.series_choice.setCurrentIndex(keys.index(current))
+        self.series_choice.blockSignals(False)
+        self.redraw_series()
+
+    def redraw_series(self):
+        """Every frame's mean against when it was taken, coloured by exposure.
+
+        Interleaved: if the offset drifts with time, all exposures move together; if it
+        depends on the exposure, each one stays at its own level on every pass.
+        """
+        self.time_plot.clear()
+        series = self.series.get(self.series_choice.currentData(), {})
+        if not series:
+            return
+        t0 = min(t.min() for t, _ in series.values())
+        for i, (exposure, (t, means)) in enumerate(sorted(series.items())):
+            order = np.argsort(t)
+            self.time_plot.plot(
+                t[order] - t0, means[order], pen=pg.mkPen(color(i), width=1), symbol="o", symbolSize=5,
+                symbolBrush=color(i), symbolPen=None, name=f"{exposure * 1e3:g} ms",
+            )
 
     def lookup(self, gain, black_level) -> na.DarkFit | None:
         return self.fits.get(setting_key(gain, black_level))
@@ -544,10 +702,7 @@ class DynamicRangeTab(SectionTab):
     def on_recorded(self, recordings):
         self.measured = float(recordings[-1].stack.max())
         self.saturation_label.setText(f"Largest output value: {self.win.cam.max_value}, measured: {self.measured:g}")
-        if self.measured < self.win.cam.max_value:
-            self.say("No pixel reached the largest output value. Use a brighter light or a longer exposure.", warn=True)
-        else:
-            self.say(f"Saturated pixels read {self.measured:g}.")
+        self.say(f"The brightest pixel read {self.measured:g}.")
         self.use_measured.setChecked(True)
         self.redraw()
         self.win.results_changed()
@@ -597,156 +752,195 @@ class ShotTab(SectionTab):
     def __init__(self, win):
         super().__init__(
             win,
-            "Light the camera with a steady source at the current settings, with no pixel saturated. "
-            "Records the lit stack, then asks you to cover the camera for a dark stack at identical "
-            "settings, which removes the bias and fixed pattern. The slope of variance against mean is the "
-            "gain in counts/e⁻. Tick several recordings at the same gain to fit them together.",
+            "Light the camera unevenly, so the image runs from dark to saturated. Records one stack per "
+            "gain, with the exposure scaled so the image stays as bright as in the live view at the "
+            "current gain. Pixels clipped at 0 or the largest value in any frame are left out, and the "
+            f"line is fitted below {na.FIT_FRACTION:.0%} of the mean where the variance peaks (dotted), where wells start to fill. The bias "
+            "comes from the Read noise tab, so record read noise at the same gains and black level first. "
+            "The slope of variance against mean is the gain in counts/e⁻.",
         )
-        self.record_button.setText("Record lit + dark")
-        self.label = QtWidgets.QLineEdit("light1")
-        self.form.addRow("Label", self.label)
-        self.notes = QtWidgets.QLineEdit()
-        self.notes.setPlaceholderText("e.g. LED current, sample")
-        self.form.addRow("Notes", self.notes)
+        self.gain_edit = QtWidgets.QLineEdit("0, 1, 12, 24")
+        self.current_only = QtWidgets.QCheckBox("current gain only")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.gain_edit)
+        row.addWidget(self.current_only)
+        self.form.addRow(f"Gains ({win.cam.gain_unit})", row)
         self.frames = QtWidgets.QSpinBox(minimum=2, maximum=10_000, value=100)
-        self.frames.valueChanged.connect(self.update_estimate)
         self.form.addRow("Frames per stack", self.frames)
+        self.scale_exposure = QtWidgets.QCheckBox("scale the exposure with gain to keep the same brightness")
+        self.scale_exposure.setChecked(True)
+        self.form.addRow("", self.scale_exposure)
         self.normalise = QtWidgets.QCheckBox("rescale frames to a common mean (removes light flicker)")
         self.normalise.setChecked(True)
         self.form.addRow("", self.normalise)
+        self.log_y = QtWidgets.QCheckBox("log axis for the measured gain plot")
+        self.log_y.setChecked(True)
+        self.log_y.toggled.connect(self.redraw)
+        self.form.addRow("", self.log_y)
+        self.notes = QtWidgets.QLineEdit()
+        self.notes.setPlaceholderText("e.g. light source, LED current")
+        self.form.addRow("Notes", self.notes)
+        for w in (self.gain_edit,):
+            w.textChanged.connect(self.update_estimate)
+        for w in (self.current_only, self.scale_exposure):
+            w.toggled.connect(self.update_estimate)
+        self.frames.valueChanged.connect(self.update_estimate)
 
         self.list = QtWidgets.QListWidget()
         self.list.itemChanged.connect(self.redraw)
-        self.plot = plot_widget("Variance against mean", "mean counts (dark subtracted)", "variance (counts²)")
+        self.plot = plot_widget("Variance against mean", "mean counts − bias", "variance (counts²)")
+        self.vs_gain = plot_widget("Measured gain", f"gain setting ({win.cam.gain_unit})", "counts/e⁻")
         self.plots.addWidget(self.list, 1)
         self.plots.addWidget(self.plot, 3)
-        self.summary = QtWidgets.QLabel()
-        self.summary.setWordWrap(True)
-        self.summary.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body.addWidget(self.summary)
-        self.recordings: list[dict] = []
-        self.fit: dict | None = None
-        self._lit: Recording | None = None
+        self.plots.addWidget(self.vs_gain, 2)
+        self.table = table(
+            ["Gain", "Black level", "Exposure (ms)", "Counts/e⁻", "e⁻/count", "Intercept", "Read noise (e⁻)", "Saturation (e⁻)", "Pixels fitted", "Saturated", "Flicker"]
+        )
+        self.body.addWidget(self.table, 2)
+        # (gain, black_level) -> analysis of the latest stack at that setting
+        self.by_key: dict[tuple, dict] = {}
         self.update_estimate()
 
+    def exposure_for(self, gain: float) -> float:
+        exposure = self.win.current["exposure_us"]
+        if self.scale_exposure.isChecked():
+            exposure *= 10 ** ((self.win.current["gain"] - gain) / 20)
+        lo, hi, _ = self.win.cam.limits["exposure_us"]
+        return min(max(exposure, lo), hi)
+
     def steps(self):
-        label = self.label.text().strip() or "light"
-        return [Step(unique_path(self.win.session / "shot" / label), {}, self.frames.value(), {"section": "shot", "label": label, "notes": self.notes.text()})]
+        return [
+            Step(
+                self.win.session / "shot" / f"{g:g}{self.win.cam.gain_unit}",
+                {"gain": g, "exposure_us": self.exposure_for(g)},
+                self.frames.value(),
+                {"section": "shot", "notes": self.notes.text()},
+                replace=True,
+            )
+            for g in self.gains(self.gain_edit, self.current_only)
+        ]
 
     def record(self):
-        if self.win.live_stats.get("frac_sat", 0) > 0:
-            self.say("Some pixels are saturated. Dim the light or shorten the exposure first.", warn=True)
+        bl = self.win.current["black_level"]
+        missing = [g for g in self.gains(self.gain_edit, self.current_only) if self.win.read_tab.lookup_nearest(g, bl) is None]
+        if missing:
+            gains = ", ".join(f"{g:g}" for g in missing)
+            self.say(f"Record read noise at {gains} {self.win.cam.gain_unit} and black level {bl:g} first: it gives the bias.", warn=True)
             return
-        if self.win.prompt("light", "Uncover the camera and switch on the light source."):
-            self.win.submit(Job("shot_lit", self.steps()), self.on_lit)
+        if self.win.prompt("light", "Uncover the camera and switch on the light source. The image should run from dark to saturated."):
+            self.win.submit(Job("shot", self.steps()), self.on_recorded)
 
-    def on_lit(self, recordings):
-        self._lit = recordings[-1]
-        lit_path = self._lit.path
-        if not self.win.prompt("cover", "Now cover the camera, keeping every setting the same."):
-            self.say("Dark stack skipped, so this recording can't be analysed.", warn=True)
-            return
-        dark = Step(
-            lit_path.with_name(lit_path.name + "_dark"),
-            {},
-            self.frames.value(),
-            {"section": "shot_dark", "label": self._lit.metadata["label"], "pair": str(lit_path)},
-        )
-        self.win.submit(Job("shot_dark", [dark]), self.on_dark)
-
-    def on_dark(self, recordings):
-        dark = recordings[-1]
-        lit, self._lit = self._lit, None
-        keys = ("gain", "black_level", "exposure_us")
-        if any(not math.isclose(lit.metadata[k], dark.metadata[k]) for k in keys):
-            self.say("The settings changed between the lit and dark stacks, so they can't be paired.", warn=True)
-            return
-        self.add_pair(lit, dark)
-
-    def add_pair(self, lit: Recording, dark: Recording):
-        result = na.shot_noise(lit.stack, dark.stack, normalise=self.normalise.isChecked())
-        m = lit.metadata
-        entry = {
-            "label": m.get("label", lit.path.name),
-            "path": str(lit.path),
-            "dark_path": str(dark.path),
-            "gain": m["gain"],
-            "black_level": m["black_level"],
-            "exposure_us": m["exposure_us"],
-            "notes": m.get("notes", ""),
-            "slope": result.fit.slope,
-            "intercept": result.fit.intercept,
-            "frame_mean_cv": result.frame_mean_cv,
-            "max_mean": float(result.mean.max()),
-            "saturated": float(np.mean(lit.stack >= m["max_value"])),
-            "mean": result.mean,
-            "var": result.var,
-        }
-        self.recordings.append(entry)
-        item = QtWidgets.QListWidgetItem(
-            f"{entry['label']}  ({entry['gain']:g} {self.win.cam.gain_unit}, {entry['exposure_us'] / 1e3:g} ms): slope {entry['slope']:.4g}"
-        )
-        item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(QtCore.Qt.CheckState.Checked)
-        self.list.blockSignals(True)
-        self.list.addItem(item)
-        self.list.blockSignals(False)
-        msg = f"Frame means varied by {100 * entry['frame_mean_cv']:.2f}%."
-        if entry["saturated"] > 0:
-            self.say(msg + " Some pixels saturated, which bends the line at high means.", warn=True)
-        else:
-            self.say(msg)
+    def on_recorded(self, recordings: list[Recording]):
+        skipped = []
+        for rec in recordings:
+            m = rec.metadata
+            rn = self.win.read_tab.lookup_nearest(m["gain"], m["black_level"])
+            if rn is None:
+                skipped.append(f"{m['gain']:g}")
+                continue
+            result = na.shot_noise(rec.stack, rn["bias"], m["max_value"], normalise=self.normalise.isChecked())
+            k = result.fit.slope
+            self.by_key[setting_key(m["gain"], m["black_level"])] = {
+                "gain": m["gain"],
+                "black_level": m["black_level"],
+                "exposure_us": m["exposure_us"],
+                "notes": m.get("notes", ""),
+                "path": str(rec.path),
+                "bias": rn["bias"],
+                "gain_counts_per_e": k,
+                "intercept": result.fit.intercept,
+                "read_noise_e": rn["read_noise"] / k if k > 0 else math.nan,
+                "saturation_e": (m["max_value"] - rn["bias"]) / k if k > 0 else math.nan,
+                "saturation_mean": result.saturation_mean,
+                "fit_max": result.fit_max,
+                "pixels": result.fitted,
+                "frac_used": result.fitted / (rec.stack[0].size or 1),
+                "frac_saturated": result.frac_saturated,
+                "frac_zero": result.frac_zero,
+                "frame_mean_cv": result.frame_mean_cv,
+                "binned": na.binned(result.mean, result.var),
+                "sample": self._sample(result),
+            }
+        self.refresh_list()
         self.redraw()
+        if skipped:
+            self.say(f"No read noise at {', '.join(skipped)} {self.win.cam.gain_unit} and this black level, so those stacks can't be analysed. Record read noise and open the session again.", warn=True)
+        else:
+            rows = [self.by_key[setting_key(r.metadata["gain"], r.metadata["black_level"])] for r in recordings]
+            worst = max(rows, key=lambda r: r["frame_mean_cv"])
+            self.say(f"Frame means varied by up to {100 * worst['frame_mean_cv']:.2f}%.")
         self.win.results_changed()
 
-    def selected(self) -> list[dict]:
-        return [r for i, r in enumerate(self.recordings) if self.list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+    @staticmethod
+    def _sample(result: na.ShotNoise) -> tuple[np.ndarray, np.ndarray]:
+        n = min(MAX_SCATTER, result.pixels)
+        idx = np.random.default_rng(0).choice(result.pixels, n, replace=False) if n else np.array([], dtype=int)
+        return result.mean[idx], result.var[idx]
+
+    def rows(self) -> list[dict]:
+        return sorted(self.by_key.values(), key=lambda r: (r["black_level"], r["gain"]))
+
+    def refresh_list(self):
+        hidden = {self.list.item(i).data(QtCore.Qt.ItemDataRole.UserRole) for i in range(self.list.count()) if self.list.item(i).checkState() != QtCore.Qt.CheckState.Checked}
+        self.list.blockSignals(True)
+        self.list.clear()
+        for r in self.rows():
+            key = setting_key(r["gain"], r["black_level"])
+            item = QtWidgets.QListWidgetItem(f"{r['gain']:g} {self.win.cam.gain_unit} (bl {r['black_level']:g})")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked if key in hidden else QtCore.Qt.CheckState.Checked)
+            self.list.addItem(item)
+        self.list.blockSignals(False)
+
+    def shown(self) -> set:
+        return {self.list.item(i).data(QtCore.Qt.ItemDataRole.UserRole) for i in range(self.list.count()) if self.list.item(i).checkState() == QtCore.Qt.CheckState.Checked}
 
     def redraw(self):
+        rows = self.rows()
+        fill_table(
+            self.table,
+            [
+                [
+                    r["gain"], r["black_level"], r["exposure_us"] / 1e3, r["gain_counts_per_e"], 1 / r["gain_counts_per_e"], r["intercept"],
+                    r["read_noise_e"], r["saturation_e"], f"{100 * r['frac_used']:.1f}%", f"{100 * r['frac_saturated']:.1f}%", f"{100 * r['frame_mean_cv']:.2f}%",
+                ]
+                for r in rows
+            ],
+        )
         self.plot.clear()
-        chosen = self.selected()
-        self.fit = None
-        if not chosen:
-            self.summary.setText("")
-            return
-        gain, bl = chosen[0]["gain"], chosen[0]["black_level"]
-        same = [r for r in chosen if setting_key(r["gain"], r["black_level"]) == setting_key(gain, bl)]
-        rng = np.random.default_rng(0)
-        for i, r in enumerate(same):
-            idx = rng.choice(r["mean"].size, min(MAX_SCATTER, r["mean"].size), replace=False)
-            self.plot.plot(r["mean"][idx], r["var"][idx], pen=None, symbol="o", symbolSize=3, symbolPen=None, symbolBrush=pg.mkBrush(color(i) + "60"), name=r["label"])
-        fit = na.pooled_fit([(r["mean"], r["var"]) for r in same])
-        xmax = max(r["max_mean"] for r in same)
-        self.plot.plot([0, xmax], [fit.intercept, fit.intercept + fit.slope * xmax], pen=pg.mkPen("#0b0b0b", width=2, style=QtCore.Qt.PenStyle.DashLine), name="fit")
-        rn = self.win.read_tab.lookup(gain, bl)
-        dark = self.win.dark_tab.lookup(gain, bl)
-        k = fit.slope
-        self.fit = {"gain": gain, "black_level": bl, "gain_counts_per_e": k, "intercept": fit.intercept, "recordings": [r["label"] for r in same]}
-        lines = [
-            f"<b>Gain at {gain:g} {self.win.cam.gain_unit}: {k:.4g} counts/e⁻</b> ({1 / k:.3g} e⁻/count), from {len(same)} recording(s).",
-            f"Intercept {fit.intercept:.4g} counts², implying read noise {math.sqrt(fit.intercept):.3g} counts" if fit.intercept > 0 else f"Intercept {fit.intercept:.4g} counts² (negative: the extrapolation to 0 is unreliable)",
-        ]
-        if rn:
-            lines.append(f"Read noise measured directly: {rn['read_noise']:.3g} counts = <b>{rn['read_noise'] / k:.3g} e⁻</b>; saturation {(self.win.cam.max_value - rn['bias']) / k:.4g} e⁻.")
-            self.fit.update(read_noise_e=rn["read_noise"] / k, saturation_e=(self.win.cam.max_value - rn["bias"]) / k)
-        if dark:
-            lines.append(f"Dark counts: {dark.slope:.3g} counts/px/s = <b>{dark.slope / k:.3g} e⁻/px/s</b>.")
-            self.fit.update(dark_e_per_s=dark.slope / k)
-        if len(same) < len(chosen):
-            lines.append("Recordings at a different gain or black level are left out of the fit.")
-        self.summary.setText("<br>".join(lines))
+        shown = self.shown()
+        for i, r in enumerate(rows):
+            if setting_key(r["gain"], r["black_level"]) not in shown:
+                continue
+            c = color(i)
+            mean, var = r["sample"]
+            self.plot.plot(mean, var, pen=None, symbol="o", symbolSize=2, symbolPen=None, symbolBrush=pg.mkBrush(c + "30"))
+            bx, by = r["binned"]
+            self.plot.plot(bx, by, pen=None, symbol="o", symbolSize=6, symbolBrush=c, name=f"{r['gain']:g} {self.win.cam.gain_unit}")
+            xmax = r["fit_max"]
+            if math.isfinite(xmax) and math.isfinite(r["gain_counts_per_e"]):
+                self.plot.plot([0, xmax], [r["intercept"], r["intercept"] + r["gain_counts_per_e"] * xmax], pen=pg.mkPen(c, width=2, style=QtCore.Qt.PenStyle.DashLine))
+                self.plot.addItem(pg.InfiniteLine(xmax, angle=90, pen=pg.mkPen(c, style=QtCore.Qt.PenStyle.DotLine)))
+        self.vs_gain.clear()
+        self.vs_gain.setLogMode(x=False, y=self.log_y.isChecked())
+        for i, bl in enumerate(sorted({r["black_level"] for r in rows})):
+            sel = [r for r in rows if r["black_level"] == bl and r["gain_counts_per_e"] > 0]
+            if not sel:
+                continue
+            self.vs_gain.plot([r["gain"] for r in sel], [r["gain_counts_per_e"] for r in sel], pen=None, symbol="o", symbolBrush=color(i), name=f"black level {bl:g}")
+            # The nominal gain, 10^(dB/20) times the measured gain at the lowest setting
+            g0, k0 = sel[0]["gain"], sel[0]["gain_counts_per_e"]
+            gs = np.linspace(g0, sel[-1]["gain"], 50)
+            self.vs_gain.plot(gs, k0 * 10 ** ((gs - g0) / 20), pen=pg.mkPen(color(i), style=QtCore.Qt.PenStyle.DashLine))
         self.win.dark_tab.redraw()
 
     def gain_for(self, gain, black_level) -> float | None:
-        if self.fit and setting_key(self.fit["gain"], self.fit["black_level"]) == setting_key(gain, black_level):
-            return self.fit["gain_counts_per_e"]
-        return None
+        r = self.by_key.get(setting_key(gain, black_level))
+        return r["gain_counts_per_e"] if r and r["gain_counts_per_e"] > 0 else None
 
     def results(self):
-        return {
-            "fit": self.fit,
-            "recordings": [{k: v for k, v in r.items() if k not in ("mean", "var")} for r in self.recordings],
-        }
+        return [{k: v for k, v in r.items() if k not in ("binned", "sample")} for r in self.rows()]
 
 
 # --------------------------------------------------------------------------- main window
@@ -776,21 +970,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.recorded.connect(self.on_recorded)
         self.worker.failed.connect(self.on_failed)
 
-        splitter = QtWidgets.QSplitter()
-        self.setCentralWidget(splitter)
-        splitter.addWidget(self._live_panel())
-        right = QtWidgets.QWidget()
-        rl = QtWidgets.QVBoxLayout(right)
-        self.tabs = QtWidgets.QTabWidget()
+        live = self._live_panel()
         self.read_tab = ReadNoiseTab(self)
         self.dark_tab = DarkTab(self)
         self.shot_tab = ShotTab(self)
         self.dr_tab = DynamicRangeTab(self)
-        self.tabs.addTab(self.read_tab, "Read noise")
-        self.tabs.addTab(self.dark_tab, "Dark counts")
-        self.tabs.addTab(self.dr_tab, "Dynamic range")
-        self.tabs.addTab(self.shot_tab, "Shot noise")
-        rl.addWidget(self.tabs)
         bar = QtWidgets.QHBoxLayout()
         self.progress = QtWidgets.QProgressBar()
         self.progress.setFormat("%v / %m frames")
@@ -799,13 +983,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cancel_button.clicked.connect(self.worker.cancel.set)
         bar.addWidget(self.progress, 1)
         bar.addWidget(self.cancel_button)
-        rl.addLayout(bar)
-        splitter.addWidget(right)
-        splitter.setSizes([700, 900])
+        self.view = PracticalView(
+            live,
+            [
+                ("Read noise", self.read_tab),
+                ("Dark counts", self.dark_tab),
+                ("Dynamic range", self.dr_tab),
+                ("Shot noise", self.shot_tab),
+            ],
+            bar,
+            self.session_buttons,
+        )
+        self.setCentralWidget(self.view)
         self.statusBar().showMessage(f"Session: {session}")
-        if self.current["black_level"] <= 0:
-            lo, hi, _ = cam.limits["black_level"]
-            self.worker.request("set", "black_level", min(max(DEFAULT_BLACK_LEVEL, lo), hi))
         self.worker.start()
 
     def _live_panel(self) -> QtWidgets.QWidget:
@@ -859,7 +1049,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(new)
         row.addWidget(opened)
         layout.addLayout(row)
-        self.controls = [self.black, self.gain, self.exposure, new, opened]
+        self.session_buttons = [new, opened]
+        self.controls = [self.black, self.gain, self.exposure, *self.session_buttons]
         return panel
 
     # ---- live
@@ -886,8 +1077,6 @@ class MainWindow(QtWidgets.QMainWindow):
         new_shape = image.shape != self._shape
         self._shape = image.shape
         self.image.setImage(image, autoRange=new_shape, autoLevels=False, levels=levels, autoHistogramRange=new_shape)
-        warn = stats["frac_zero"] > WARN_FRACTION or stats["frac_sat"] > WARN_FRACTION
-        self.stats.setStyleSheet("color: #c92a2a;" if warn else "")
         self.stats.setText(
             f"mean {stats['mean']:8.1f}   at 0: {100 * stats['frac_zero']:5.2f}%   "
             f"saturated: {100 * stats['frac_sat']:5.2f}%   {stats['fps']:5.1f} fps   missed {stats['missing']}"
@@ -908,7 +1097,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for step in job.steps:
             if step.replace:
                 supersede(step.path, self.session)
-        self.statusBar().showMessage(f"Recording {job.name}, about {format_duration(estimate_seconds(job.steps))}")
+        self.statusBar().showMessage(f"Recording {job.name}, about {format_duration(estimate_seconds(job.steps, interleave=job.interleave))}")
         self.worker.request("job", job)
 
     def _idle(self):
@@ -989,16 +1178,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 if meta.get("cancelled"):
                     continue
                 section = meta.get("section")
-                stack = None if section == "dark" else load_recording(path, step)[0]
+                # Dark counts only need the frame means in metadata.json. Older sessions also
+                # hold shot_dark stacks, which the shot noise analysis no longer uses.
+                stack = load_recording(path, step)[0] if section in ("read_noise", "shot", "saturation") else None
                 groups.setdefault(section, []).append(Recording(path, meta, stack))
             if groups.get("read_noise"):
                 self.read_tab.on_recorded(groups["read_noise"])
             if groups.get("dark"):
                 self.dark_tab.on_recorded(groups["dark"])
-            darks = {r.metadata.get("pair"): r for r in groups.get("shot_dark", [])}
-            for lit in groups.get("shot", []):
-                if str(lit.path) in darks:
-                    self.shot_tab.add_pair(lit, darks[str(lit.path)])
+            if groups.get("shot"):
+                self.shot_tab.on_recorded(groups["shot"])
             if groups.get("saturation"):
                 self.dr_tab.on_recorded(groups["saturation"][-1:])
             self.results_changed()

@@ -80,6 +80,63 @@ def color(i: int) -> str:
     return PALETTE[i % len(PALETTE)]
 
 
+class PracticalView(QtWidgets.QWidget):
+    """The live panel under a row of tabs: "Live" first, then one tab per section of the practical.
+
+    "Live" shows the live panel alone, with `sections_only` hidden, for trying the detector out.
+    Any other tab shows its section, with `footer` under it, to the right of the live panel.
+    """
+
+    def __init__(
+        self,
+        live: QtWidgets.QWidget,
+        sections: list[tuple[str, QtWidgets.QWidget]],
+        footer: QtWidgets.QLayout,
+        sections_only: list[QtWidgets.QWidget],
+    ):
+        super().__init__()
+        self.sections_only = sections_only
+        self.sizes = [700, 900]
+        self.bar = QtWidgets.QTabBar()
+        self.bar.setExpanding(False)
+        self.stack = QtWidgets.QStackedWidget()
+        self.right = QtWidgets.QWidget()
+        right = QtWidgets.QVBoxLayout(self.right)
+        right.addWidget(self.stack)
+        right.addLayout(footer)
+        self.splitter = QtWidgets.QSplitter()
+        self.splitter.addWidget(live)
+        self.splitter.addWidget(self.right)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.splitter, 1)
+        self.bar.addTab("Live")
+        for title, widget in sections:
+            self.bar.addTab(title)
+            self.stack.addWidget(widget)
+        self.bar.currentChanged.connect(self._show)
+        self._show(0)
+
+    def titles(self) -> list[str]:
+        return [self.bar.tabText(i) for i in range(self.bar.count())]
+
+    def select(self, title: str):
+        self.bar.setCurrentIndex(self.titles().index(title))
+
+    def _show(self, index: int):
+        section = index > 0
+        was_section = not self.right.isHidden()
+        if was_section and not section and all(self.splitter.sizes()):
+            self.sizes = self.splitter.sizes()  # come back to the split the user left
+        self.right.setVisible(section)
+        for w in self.sections_only:
+            w.setVisible(section)
+        if section:
+            self.stack.setCurrentIndex(index - 1)
+            if not was_section:
+                self.splitter.setSizes(self.sizes)
+
+
 def close_window(win: QtWidgets.QWidget) -> None:
     """Close a window and run its deletion now, not at some later garbage collection."""
     win.close()
